@@ -40,17 +40,25 @@ except ImportError:
 
 app = FastAPI(title="Astolog — Vedic Kundali & Agentic AI Engine")
 
+ALLOWED_ORIGINS = [
+    "https://astrotags.in",
+    "https://www.astrotags.in",
+    "https://astrotag.in",
+    "https://www.astrotag.in",
+    "https://astrotag-in.pages.dev",
+    "https://astrotag.pages.dev",
+    "https://astrotag.vercel.app",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "*"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://astrotags.in",
-        "https://www.astrotags.in",
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:5173",
-        "*"
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https://([a-z0-9-]+\.)?astrotags?\.(in|pages\.dev|vercel\.app)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -878,12 +886,19 @@ def ord_suffix(n: int) -> str:
         return f"{n_int}th"
     return f"{n_int}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n_int % 10, 'th') }"
 
-def get_fallback_daily_outlook(active_dasha_lords: List[str] = None, query_dt: datetime = None) -> Dict[str, Any]:
-    if query_dt is None:
-        query_dt = datetime.now(pytz.timezone("Asia/Kolkata"))
-    gen_time = query_dt.strftime("%Y-%m-%d %H:%M IST") if hasattr(query_dt, "strftime") else str(query_dt)
+def get_fallback_daily_outlook(active_dasha_lords: List[str] = None, query_dt: Any = None) -> Dict[str, Any]:
+    try:
+        if query_dt is None or not hasattr(query_dt, "strftime"):
+            query_dt = datetime.now(pytz.timezone("Asia/Kolkata"))
+        gen_time = query_dt.strftime("%Y-%m-%d %H:%M IST")
+    except Exception:
+        gen_time = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
-    lords = [str(l) for l in (active_dasha_lords or []) if l]
+    lords = []
+    if isinstance(active_dasha_lords, (list, tuple)):
+        for l in active_dasha_lords:
+            if l and isinstance(l, str) and l in DASHA_ORDER:
+                lords.append(l)
     if len(lords) < 1: lords.append("Jupiter")
     if len(lords) < 2: lords.append("Saturn")
     if len(lords) < 3: lords.append("Mercury")
@@ -941,27 +956,36 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
     3. Sade Sati Check: house distance of transit Saturn from natal Moon (12th=Rising, 1st=Peak, 2nd=Setting, else None).
     Returns a dictionary containing generated_at, sade_sati, active_pratyantardasha, and 5 categorized outlook items.
     """
-    if query_datetime is None:
-        ist_tz = pytz.timezone("Asia/Kolkata")
-        query_dt = datetime.now(ist_tz)
-    elif isinstance(query_datetime, str):
-        try:
-            query_dt = datetime.fromisoformat(query_datetime)
-        except Exception:
-            ist_tz = pytz.timezone("Asia/Kolkata")
-            query_dt = datetime.now(ist_tz)
-    else:
-        query_dt = query_datetime
+    md_lord, ad_lord, pd_lord = "Jupiter", "Saturn", "Mercury"
+    query_dt = None
 
     try:
-        # Format timestamp
-        if hasattr(query_dt, "strftime"):
-            if getattr(query_dt, "tzinfo", None) is not None:
-                generated_at = query_dt.strftime("%Y-%m-%d %H:%M %Z")
-            else:
-                generated_at = query_dt.strftime("%Y-%m-%d %H:%M IST")
+        if query_datetime is None:
+            ist_tz = pytz.timezone("Asia/Kolkata")
+            query_dt = datetime.now(ist_tz)
+        elif isinstance(query_datetime, str):
+            try:
+                query_dt = datetime.fromisoformat(query_datetime)
+            except Exception:
+                ist_tz = pytz.timezone("Asia/Kolkata")
+                query_dt = datetime.now(ist_tz)
+        elif isinstance(query_datetime, datetime):
+            query_dt = query_datetime
         else:
-            generated_at = str(query_dt)
+            ist_tz = pytz.timezone("Asia/Kolkata")
+            query_dt = datetime.now(ist_tz)
+
+        # Format timestamp
+        try:
+            if hasattr(query_dt, "strftime"):
+                if getattr(query_dt, "tzinfo", None) is not None:
+                    generated_at = query_dt.strftime("%Y-%m-%d %H:%M %Z")
+                else:
+                    generated_at = query_dt.strftime("%Y-%m-%d %H:%M IST")
+            else:
+                generated_at = str(query_dt)
+        except Exception:
+            generated_at = datetime.now().strftime("%Y-%m-%d %H:%M IST")
 
         # 1. Extract Ascendant (Lagna) Sign (1-12)
         asc_sign = None
@@ -974,9 +998,10 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
                     asc_sign = (int(float(natal_data["asc_abs_deg"]) // 30.0) % 12) + 1
                 except (ValueError, TypeError):
                     pass
-        if not asc_sign:
+        try:
+            asc_sign = ((int(asc_sign) - 1) % 12) + 1 if asc_sign is not None else 1
+        except (ValueError, TypeError):
             asc_sign = 1
-        asc_sign = ((int(asc_sign) - 1) % 12) + 1
 
         # 2. Extract Natal Moon Sign (1-12)
         moon_sign = None
@@ -987,14 +1012,17 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
             if not moon_sign:
                 raw_planets = natal_data.get("raw_planets", {})
                 if isinstance(raw_planets, dict) and "Moon" in raw_planets:
-                    moon_deg = raw_planets["Moon"].get("abs_deg", 0.0)
-                    try:
-                        moon_sign = (int(float(moon_deg) // 30.0) % 12) + 1
-                    except (ValueError, TypeError):
-                        pass
-        if not moon_sign:
+                    moon_info = raw_planets.get("Moon", {})
+                    if isinstance(moon_info, dict):
+                        moon_deg = moon_info.get("abs_deg", 0.0)
+                        try:
+                            moon_sign = (int(float(moon_deg) // 30.0) % 12) + 1
+                        except (ValueError, TypeError):
+                            pass
+        try:
+            moon_sign = ((int(moon_sign) - 1) % 12) + 1 if moon_sign is not None else 1
+        except (ValueError, TypeError):
             moon_sign = 1
-        moon_sign = ((int(moon_sign) - 1) % 12) + 1
 
         # 3. Extract Transit Signs for key Grahas
         transit_signs = {}
@@ -1009,7 +1037,10 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
             elif any(k in transit_data for k in ["Jupiter", "Saturn", "Sun"]):
                 for k, v in transit_data.items():
                     if isinstance(v, (int, float)):
-                        transit_signs[str(k)] = ((int(v) - 1) % 12) + 1
+                        try:
+                            transit_signs[str(k)] = ((int(v) - 1) % 12) + 1
+                        except (ValueError, TypeError):
+                            pass
                     elif isinstance(v, dict) and "abs_deg" in v:
                         try:
                             transit_signs[str(k)] = (int(float(v["abs_deg"]) // 30.0) % 12) + 1
@@ -1025,47 +1056,48 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
                     if isinstance(row, dict):
                         pname = row.get("planet")
                         snum = row.get("sign_num")
-                        if pname and snum:
+                        if pname and snum is not None:
                             try:
                                 transit_signs[str(pname)] = ((int(snum) - 1) % 12) + 1
                             except (ValueError, TypeError):
                                 pass
 
-        required_planets = ["Jupiter", "Saturn", "Venus", "Mercury", "Mars", "Sun", "Moon"]
-        if any(p not in transit_signs for p in required_planets):
-            try:
-                now_utc = datetime.now(pytz.utc)
-                fallback_snap = calculate_sidereal_snapshot(now_utc, 28.6139, 77.2090)
-                for p, info in fallback_snap.get("raw_planets", {}).items():
-                    if p not in transit_signs and isinstance(info, dict) and "abs_deg" in info:
-                        transit_signs[str(p)] = (int(float(info["abs_deg"]) // 30.0) % 12) + 1
-            except Exception:
-                # Safe defaults if ephemeris lookup fails
-                default_signs = {"Jupiter": 2, "Saturn": 11, "Venus": 9, "Mercury": 8, "Mars": 4, "Sun": 8, "Moon": 4}
-                for rp, ds in default_signs.items():
-                    if rp not in transit_signs:
-                        transit_signs[rp] = ds
+        required_planets = ["Jupiter", "Saturn", "Venus", "Mercury", "Mars", "Sun", "Moon", "Rahu", "Ketu"]
+        default_signs = {
+            "Jupiter": 2, "Saturn": 11, "Venus": 9, "Mercury": 8,
+            "Mars": 4, "Sun": 8, "Moon": 4, "Rahu": 11, "Ketu": 5
+        }
+        for rp in required_planets:
+            if rp not in transit_signs or not isinstance(transit_signs[rp], int):
+                transit_signs[rp] = default_signs.get(rp, 1)
 
         # 4. Extract Active Vimshottari Dasha up to Level 3 (MD -> AD -> PD)
-        md_lord, ad_lord, pd_lord = "Jupiter", "Saturn", "Mercury"
         if isinstance(dasha_tree, list) and len(dasha_tree) > 0:
             if isinstance(dasha_tree[0], dict) and "active_lord" in dasha_tree[0]:
-                md_lord = str(dasha_tree[0]["active_lord"])
-                ad_lord = str(dasha_tree[1]["active_lord"]) if len(dasha_tree) > 1 and "active_lord" in dasha_tree[1] else md_lord
-                pd_lord = str(dasha_tree[2]["active_lord"]) if len(dasha_tree) > 2 and "active_lord" in dasha_tree[2] else ad_lord
+                md_lord = str(dasha_tree[0].get("active_lord", "Jupiter"))
+                ad_lord = str(dasha_tree[1].get("active_lord", md_lord)) if len(dasha_tree) > 1 and isinstance(dasha_tree[1], dict) else md_lord
+                pd_lord = str(dasha_tree[2].get("active_lord", ad_lord)) if len(dasha_tree) > 2 and isinstance(dasha_tree[2], dict) else ad_lord
             elif isinstance(dasha_tree[0], dict) and ("mahadasha" in dasha_tree[0] or "lord" in dasha_tree[0]):
                 target_naive = query_dt.replace(tzinfo=None) if getattr(query_dt, "tzinfo", None) else query_dt
                 try:
                     chain = build_active_dasha_chain(dasha_tree, target_naive)
-                    if len(chain) > 0: md_lord = str(chain[0].get("active_lord", md_lord))
-                    if len(chain) > 1: ad_lord = str(chain[1].get("active_lord", ad_lord))
-                    if len(chain) > 2: pd_lord = str(chain[2].get("active_lord", pd_lord))
+                    if len(chain) > 0 and isinstance(chain[0], dict): md_lord = str(chain[0].get("active_lord", md_lord))
+                    if len(chain) > 1 and isinstance(chain[1], dict): ad_lord = str(chain[1].get("active_lord", ad_lord))
+                    if len(chain) > 2 and isinstance(chain[2], dict): pd_lord = str(chain[2].get("active_lord", pd_lord))
                 except Exception:
                     pass
             elif isinstance(dasha_tree[0], str):
                 md_lord = str(dasha_tree[0])
                 ad_lord = str(dasha_tree[1]) if len(dasha_tree) > 1 else md_lord
                 pd_lord = str(dasha_tree[2]) if len(dasha_tree) > 2 else ad_lord
+        elif isinstance(dasha_tree, dict):
+            md_lord = str(dasha_tree.get("mahadasha") or dasha_tree.get("active_lord") or dasha_tree.get("md") or "Jupiter")
+            ad_lord = str(dasha_tree.get("antardasha") or dasha_tree.get("ad") or md_lord)
+            pd_lord = str(dasha_tree.get("pratyantardasha") or dasha_tree.get("pd") or ad_lord)
+
+        if md_lord not in DASHA_ORDER: md_lord = "Jupiter"
+        if ad_lord not in DASHA_ORDER: ad_lord = "Saturn"
+        if pd_lord not in DASHA_ORDER: pd_lord = "Mercury"
 
         active_pratyantardasha = f"{md_lord} - {ad_lord} - {pd_lord}"
 
@@ -1097,9 +1129,11 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
                 lord_to_houses[lord] = []
             lord_to_houses[lord].append(h)
 
-        lagna_lord = house_to_lord[1]
+        lagna_lord = house_to_lord.get(1, "Mars")
 
         def is_functional_benefic(pname: str) -> bool:
+            if not pname or not isinstance(pname, str):
+                return False
             if pname == lagna_lord:
                 return True
             owned = lord_to_houses.get(pname, [])
@@ -1115,7 +1149,7 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
             return False
 
         def transit_house_from_lagna(pname: str) -> int:
-            s = transit_signs.get(pname, 1)
+            s = transit_signs.get(str(pname), 1)
             try:
                 s_int = int(s)
             except (ValueError, TypeError):
@@ -1208,8 +1242,8 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
         if 5 in jup_aspects or 7 in jup_aspects:
             love_score += 1.5
 
-        h5_lord = house_to_lord[5]
-        h7_lord = house_to_lord[7]
+        h5_lord = house_to_lord.get(5, "Sun")
+        h7_lord = house_to_lord.get(7, "Venus")
         for l_name in [md_lord, ad_lord, pd_lord]:
             if l_name in [h5_lord, h7_lord, "Venus"]:
                 love_score += 1.5
@@ -1254,7 +1288,7 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
 
         # --- ITEM 3: Good Time to Buy Vehicle ---
         veh_score = 0.0
-        h4_lord = house_to_lord[4]
+        h4_lord = house_to_lord.get(4, "Moon")
         if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
             veh_score += 1.5
         else:
@@ -1316,8 +1350,8 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
         if jup_h in [1, 2, 5, 9, 11]:
             lux_score += 1.5
 
-        h2_lord = house_to_lord[2]
-        h11_lord = house_to_lord[11]
+        h2_lord = house_to_lord.get(2, "Venus")
+        h11_lord = house_to_lord.get(11, "Saturn")
         for l_name in [md_lord, ad_lord, pd_lord]:
             if l_name in ["Venus", h2_lord, h11_lord]:
                 lux_score += 1.5
@@ -1469,8 +1503,11 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
         }
     except Exception as err:
         print(f"Error evaluating daily outlook: {err}")
-        active_fallback = [md_lord, ad_lord, pd_lord] if 'md_lord' in locals() else None
-        return get_fallback_daily_outlook(active_fallback, query_dt)
+        try:
+            active_fallback = [md_lord, ad_lord, pd_lord]
+        except Exception:
+            active_fallback = ["Jupiter", "Saturn", "Mercury"]
+        return get_fallback_daily_outlook(active_fallback, query_dt if 'query_dt' in locals() and query_dt is not None else None)
 
 @app.post("/api/kundali")
 @app.post("/kundali")
@@ -1555,7 +1592,10 @@ def generate_kundali(data: BirthInput):
     active_dasha_chain = build_active_dasha_chain(dasha_timeline, now_local)
 
     # Extract active MD, AD, PD, SD lords (up to Sookshma Dasha)
-    active_dasha_4 = [c["active_lord"] for c in active_dasha_chain[:4]]
+    active_dasha_4 = [c["active_lord"] for c in active_dasha_chain[:4] if isinstance(c, dict) and "active_lord" in c]
+    default_dasha_lords = ["Jupiter", "Saturn", "Mercury", "Venus"]
+    while len(active_dasha_4) < 4:
+        active_dasha_4.append(default_dasha_lords[len(active_dasha_4)])
 
     now_utc = datetime.now(pytz.utc)
     delhi_snap = calculate_sidereal_snapshot(now_utc, 28.6139, 77.2090)
@@ -1604,9 +1644,14 @@ def generate_kundali(data: BirthInput):
             dasha_tree=active_dasha_chain,
             query_datetime=now_ist
         )
+        if not isinstance(daily_outlook, dict) or "items" not in daily_outlook or len(daily_outlook.get("items", [])) != 5:
+            daily_outlook = get_fallback_daily_outlook(active_dasha_4, now_ist)
     except Exception as e:
         print(f"Error computing daily outlook: {e}")
-        daily_outlook = get_fallback_daily_outlook(active_dasha_4, now_ist)
+        try:
+            daily_outlook = get_fallback_daily_outlook(active_dasha_4, now_ist)
+        except Exception:
+            daily_outlook = get_fallback_daily_outlook(None, None)
 
     sookshma_summary = f"{active_dasha_4[0]} MD / {active_dasha_4[1]} AD / {active_dasha_4[2]} PD / {active_dasha_4[3]} SD"
 
