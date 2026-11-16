@@ -42,7 +42,16 @@ app = FastAPI(title="Astolog — Vedic Kundali & Agentic AI Engine")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://astrotags.in",
+        "https://www.astrotags.in",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:5173",
+        "*"
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -196,10 +205,18 @@ def sanitize_for_json(obj: Any) -> Any:
     return obj
 
 class BirthInput(BaseModel):
-    name: str
+    name: Optional[str] = "User"
     dob: str
-    tob: str
-    place: str
+    tob: Optional[str] = "12:00"
+    place: Optional[str] = "New Delhi, India"
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    lng: Optional[float] = None
+    timezone: Optional[str] = None
+    tz: Optional[str] = None
+    gender: Optional[str] = None
 
 class DashaExpandRequest(BaseModel):
     parent_lord: str
@@ -853,9 +870,68 @@ def resolve_place_coordinates(place_str: str):
     return None
 
 def ord_suffix(n: int) -> str:
-    if 11 <= (n % 100) <= 13:
+    try:
+        n_int = int(n)
+    except (ValueError, TypeError):
         return f"{n}th"
-    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+    if 11 <= (n_int % 100) <= 13:
+        return f"{n_int}th"
+    return f"{n_int}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n_int % 10, 'th') }"
+
+def get_fallback_daily_outlook(active_dasha_lords: List[str] = None, query_dt: datetime = None) -> Dict[str, Any]:
+    if query_dt is None:
+        query_dt = datetime.now(pytz.timezone("Asia/Kolkata"))
+    gen_time = query_dt.strftime("%Y-%m-%d %H:%M IST") if hasattr(query_dt, "strftime") else str(query_dt)
+
+    lords = [str(l) for l in (active_dasha_lords or []) if l]
+    if len(lords) < 1: lords.append("Jupiter")
+    if len(lords) < 2: lords.append("Saturn")
+    if len(lords) < 3: lords.append("Mercury")
+
+    md, ad, pd = lords[0], lords[1], lords[2]
+
+    return {
+        "generated_at": gen_time,
+        "sade_sati": {"active": False, "phase": "None"},
+        "active_pratyantardasha": f"{md} - {ad} - {pd}",
+        "items": [
+            {
+                "id": "present_scenario",
+                "title": "Present Scenario",
+                "status": "favourable",
+                "badge_label": "Favourable",
+                "summary": f"Your running {md}-{ad} Dasha combined with supportive cosmic transits provides steady momentum. Maintain focus and calm discipline in your daily tasks."
+            },
+            {
+                "id": "love_life",
+                "title": "Love Life",
+                "status": "favourable",
+                "badge_label": "Favourable",
+                "summary": f"Under your {pd} Pratyantardasha, open-hearted communication fosters tenderness and deeper understanding in relationships."
+            },
+            {
+                "id": "good_time_to_buy_vehicle",
+                "title": "Good Time to Buy Vehicle",
+                "status": "mindful",
+                "badge_label": "Mindful Phase",
+                "summary": "Carefully review vehicle features, budget, and mechanical specifications before finalizing your choice."
+            },
+            {
+                "id": "good_time_to_buy_luxury_items",
+                "title": "Good Time to Buy Luxury Items",
+                "status": "favourable",
+                "badge_label": "Favourable",
+                "summary": "A favorable period for mindful lifestyle enhancements that offer lasting quality and enduring comfort."
+            },
+            {
+                "id": "good_time_to_buy_share_or_investment",
+                "title": "Good Time to Buy Share or Investment",
+                "status": "mindful",
+                "badge_label": "Mindful Phase",
+                "summary": "Focus on disciplined capital preservation and long-term asset building over speculative short-term trading."
+            }
+        ]
+    }
 
 def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, query_datetime: Any = None) -> Dict[str, Any]:
     """
@@ -877,498 +953,595 @@ def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, q
     else:
         query_dt = query_datetime
 
-    # Format timestamp
-    if hasattr(query_dt, "strftime"):
-        if getattr(query_dt, "tzinfo", None) is not None:
-            generated_at = query_dt.strftime("%Y-%m-%d %H:%M %Z")
+    try:
+        # Format timestamp
+        if hasattr(query_dt, "strftime"):
+            if getattr(query_dt, "tzinfo", None) is not None:
+                generated_at = query_dt.strftime("%Y-%m-%d %H:%M %Z")
+            else:
+                generated_at = query_dt.strftime("%Y-%m-%d %H:%M IST")
         else:
-            generated_at = query_dt.strftime("%Y-%m-%d %H:%M IST")
-    else:
-        generated_at = str(query_dt)
+            generated_at = str(query_dt)
 
-    # 1. Extract Ascendant (Lagna) Sign (1-12)
-    asc_sign = None
-    if isinstance(natal_data, dict):
-        asc_sign = natal_data.get("asc_sign") or natal_data.get("d1_asc_sign")
-        if not asc_sign and "natal_meta" in natal_data:
-            asc_sign = natal_data["natal_meta"].get("d1_asc_sign")
-        if not asc_sign and "asc_abs_deg" in natal_data:
-            asc_sign = int(natal_data["asc_abs_deg"] // 30.0) + 1
-    if not asc_sign:
-        asc_sign = 1
+        # 1. Extract Ascendant (Lagna) Sign (1-12)
+        asc_sign = None
+        if isinstance(natal_data, dict):
+            asc_sign = natal_data.get("asc_sign") or natal_data.get("d1_asc_sign")
+            if not asc_sign and "natal_meta" in natal_data and isinstance(natal_data["natal_meta"], dict):
+                asc_sign = natal_data["natal_meta"].get("d1_asc_sign")
+            if not asc_sign and "asc_abs_deg" in natal_data:
+                try:
+                    asc_sign = (int(float(natal_data["asc_abs_deg"]) // 30.0) % 12) + 1
+                except (ValueError, TypeError):
+                    pass
+        if not asc_sign:
+            asc_sign = 1
+        asc_sign = ((int(asc_sign) - 1) % 12) + 1
 
-    # 2. Extract Natal Moon Sign (1-12)
-    moon_sign = None
-    if isinstance(natal_data, dict):
-        moon_sign = natal_data.get("moon_sign") or natal_data.get("natal_moon_sign")
-        if not moon_sign and "natal_meta" in natal_data:
-            moon_sign = natal_data["natal_meta"].get("natal_moon_sign")
+        # 2. Extract Natal Moon Sign (1-12)
+        moon_sign = None
+        if isinstance(natal_data, dict):
+            moon_sign = natal_data.get("moon_sign") or natal_data.get("natal_moon_sign")
+            if not moon_sign and "natal_meta" in natal_data and isinstance(natal_data["natal_meta"], dict):
+                moon_sign = natal_data["natal_meta"].get("natal_moon_sign")
+            if not moon_sign:
+                raw_planets = natal_data.get("raw_planets", {})
+                if isinstance(raw_planets, dict) and "Moon" in raw_planets:
+                    moon_deg = raw_planets["Moon"].get("abs_deg", 0.0)
+                    try:
+                        moon_sign = (int(float(moon_deg) // 30.0) % 12) + 1
+                    except (ValueError, TypeError):
+                        pass
         if not moon_sign:
-            raw_planets = natal_data.get("raw_planets", {})
-            if "Moon" in raw_planets:
-                moon_deg = raw_planets["Moon"].get("abs_deg", 0.0)
-                moon_sign = int(moon_deg // 30.0) + 1
-    if not moon_sign:
-        moon_sign = 1
+            moon_sign = 1
+        moon_sign = ((int(moon_sign) - 1) % 12) + 1
 
-    # 3. Extract Transit Signs for key Grahas
-    transit_signs = {}
-    if isinstance(transit_data, dict):
-        if "raw_planets" in transit_data:
-            for p, info in transit_data["raw_planets"].items():
-                transit_signs[p] = int(info["abs_deg"] // 30.0) + 1
-        elif any(k in transit_data for k in ["Jupiter", "Saturn", "Sun"]):
-            for k, v in transit_data.items():
-                if isinstance(v, int):
-                    transit_signs[k] = v
-                elif isinstance(v, dict) and "abs_deg" in v:
-                    transit_signs[k] = int(v["abs_deg"] // 30.0) + 1
-                elif isinstance(v, dict) and "sign_num" in v:
-                    transit_signs[k] = int(v["sign_num"])
-        elif "table" in transit_data and isinstance(transit_data["table"], list):
-            for row in transit_data["table"]:
-                pname = row.get("planet")
-                snum = row.get("sign_num")
-                if pname and snum:
-                    transit_signs[pname] = int(snum)
+        # 3. Extract Transit Signs for key Grahas
+        transit_signs = {}
+        if isinstance(transit_data, dict):
+            if "raw_planets" in transit_data and isinstance(transit_data["raw_planets"], dict):
+                for p, info in transit_data["raw_planets"].items():
+                    if isinstance(info, dict) and "abs_deg" in info:
+                        try:
+                            transit_signs[str(p)] = (int(float(info["abs_deg"]) // 30.0) % 12) + 1
+                        except (ValueError, TypeError):
+                            pass
+            elif any(k in transit_data for k in ["Jupiter", "Saturn", "Sun"]):
+                for k, v in transit_data.items():
+                    if isinstance(v, (int, float)):
+                        transit_signs[str(k)] = ((int(v) - 1) % 12) + 1
+                    elif isinstance(v, dict) and "abs_deg" in v:
+                        try:
+                            transit_signs[str(k)] = (int(float(v["abs_deg"]) // 30.0) % 12) + 1
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(v, dict) and "sign_num" in v:
+                        try:
+                            transit_signs[str(k)] = ((int(v["sign_num"]) - 1) % 12) + 1
+                        except (ValueError, TypeError):
+                            pass
+            elif "table" in transit_data and isinstance(transit_data["table"], list):
+                for row in transit_data["table"]:
+                    if isinstance(row, dict):
+                        pname = row.get("planet")
+                        snum = row.get("sign_num")
+                        if pname and snum:
+                            try:
+                                transit_signs[str(pname)] = ((int(snum) - 1) % 12) + 1
+                            except (ValueError, TypeError):
+                                pass
 
-    required_planets = ["Jupiter", "Saturn", "Venus", "Mercury", "Mars", "Sun", "Moon"]
-    if any(p not in transit_signs for p in required_planets):
-        now_utc = datetime.now(pytz.utc)
-        fallback_snap = calculate_sidereal_snapshot(now_utc, 28.6139, 77.2090)
-        for p, info in fallback_snap["raw_planets"].items():
-            if p not in transit_signs:
-                transit_signs[p] = int(info["abs_deg"] // 30.0) + 1
+        required_planets = ["Jupiter", "Saturn", "Venus", "Mercury", "Mars", "Sun", "Moon"]
+        if any(p not in transit_signs for p in required_planets):
+            try:
+                now_utc = datetime.now(pytz.utc)
+                fallback_snap = calculate_sidereal_snapshot(now_utc, 28.6139, 77.2090)
+                for p, info in fallback_snap.get("raw_planets", {}).items():
+                    if p not in transit_signs and isinstance(info, dict) and "abs_deg" in info:
+                        transit_signs[str(p)] = (int(float(info["abs_deg"]) // 30.0) % 12) + 1
+            except Exception:
+                # Safe defaults if ephemeris lookup fails
+                default_signs = {"Jupiter": 2, "Saturn": 11, "Venus": 9, "Mercury": 8, "Mars": 4, "Sun": 8, "Moon": 4}
+                for rp, ds in default_signs.items():
+                    if rp not in transit_signs:
+                        transit_signs[rp] = ds
 
-    # 4. Extract Active Vimshottari Dasha up to Level 3 (MD -> AD -> PD)
-    md_lord, ad_lord, pd_lord = "Jupiter", "Saturn", "Mercury"
-    if isinstance(dasha_tree, list) and len(dasha_tree) > 0:
-        if "active_lord" in dasha_tree[0]:
-            md_lord = dasha_tree[0]["active_lord"]
-            ad_lord = dasha_tree[1]["active_lord"] if len(dasha_tree) > 1 else md_lord
-            pd_lord = dasha_tree[2]["active_lord"] if len(dasha_tree) > 2 else ad_lord
-        elif "mahadasha" in dasha_tree[0] or "lord" in dasha_tree[0]:
-            target_naive = query_dt.replace(tzinfo=None) if getattr(query_dt, "tzinfo", None) else query_dt
-            chain = build_active_dasha_chain(dasha_tree, target_naive)
-            if len(chain) > 0: md_lord = chain[0]["active_lord"]
-            if len(chain) > 1: ad_lord = chain[1]["active_lord"]
-            if len(chain) > 2: pd_lord = chain[2]["active_lord"]
-        elif isinstance(dasha_tree[0], str):
-            md_lord = dasha_tree[0]
-            ad_lord = dasha_tree[1] if len(dasha_tree) > 1 else md_lord
-            pd_lord = dasha_tree[2] if len(dasha_tree) > 2 else ad_lord
+        # 4. Extract Active Vimshottari Dasha up to Level 3 (MD -> AD -> PD)
+        md_lord, ad_lord, pd_lord = "Jupiter", "Saturn", "Mercury"
+        if isinstance(dasha_tree, list) and len(dasha_tree) > 0:
+            if isinstance(dasha_tree[0], dict) and "active_lord" in dasha_tree[0]:
+                md_lord = str(dasha_tree[0]["active_lord"])
+                ad_lord = str(dasha_tree[1]["active_lord"]) if len(dasha_tree) > 1 and "active_lord" in dasha_tree[1] else md_lord
+                pd_lord = str(dasha_tree[2]["active_lord"]) if len(dasha_tree) > 2 and "active_lord" in dasha_tree[2] else ad_lord
+            elif isinstance(dasha_tree[0], dict) and ("mahadasha" in dasha_tree[0] or "lord" in dasha_tree[0]):
+                target_naive = query_dt.replace(tzinfo=None) if getattr(query_dt, "tzinfo", None) else query_dt
+                try:
+                    chain = build_active_dasha_chain(dasha_tree, target_naive)
+                    if len(chain) > 0: md_lord = str(chain[0].get("active_lord", md_lord))
+                    if len(chain) > 1: ad_lord = str(chain[1].get("active_lord", ad_lord))
+                    if len(chain) > 2: pd_lord = str(chain[2].get("active_lord", pd_lord))
+                except Exception:
+                    pass
+            elif isinstance(dasha_tree[0], str):
+                md_lord = str(dasha_tree[0])
+                ad_lord = str(dasha_tree[1]) if len(dasha_tree) > 1 else md_lord
+                pd_lord = str(dasha_tree[2]) if len(dasha_tree) > 2 else ad_lord
 
-    active_pratyantardasha = f"{md_lord} - {ad_lord} - {pd_lord}"
+        active_pratyantardasha = f"{md_lord} - {ad_lord} - {pd_lord}"
 
-    # 5. Sade Sati Check from natal Moon
-    # Compute house distance of current transit Saturn from natal Moon (12th=Rising, 1st=Peak, 2nd=Setting; else Inactive)
-    sat_sign = transit_signs.get("Saturn", 11)
-    saturn_dist_from_moon = ((sat_sign - moon_sign) % 12) + 1
+        # 5. Sade Sati Check from natal Moon
+        sat_sign = transit_signs.get("Saturn", 11)
+        try:
+            sat_sign_int = int(sat_sign)
+        except (ValueError, TypeError):
+            sat_sign_int = 11
+        saturn_dist_from_moon = ((sat_sign_int - moon_sign) % 12) + 1
 
-    if saturn_dist_from_moon == 12:
-        sade_sati = {"active": True, "phase": "Rising"}
-    elif saturn_dist_from_moon == 1:
-        sade_sati = {"active": True, "phase": "Peak"}
-    elif saturn_dist_from_moon == 2:
-        sade_sati = {"active": True, "phase": "Setting"}
-    else:
-        sade_sati = {"active": False, "phase": "None"}
-
-    # 6. House Lordships & Functional Benefic/Malefic Analysis from Ascendant (Lagna)
-    house_to_lord = {}
-    lord_to_houses = {p: [] for p in PLANET_SHORT.keys()}
-    for h in range(1, 13):
-        s_num = ((asc_sign - 1 + (h - 1)) % 12) + 1
-        lord = SIGN_LORDS[s_num]
-        house_to_lord[h] = lord
-        lord_to_houses[lord].append(h)
-
-    lagna_lord = house_to_lord[1]
-
-    def is_functional_benefic(pname: str) -> bool:
-        if pname == lagna_lord:
-            return True
-        owned = lord_to_houses.get(pname, [])
-        has_kendra = any(h in [1, 4, 7, 10] for h in owned)
-        has_trikona = any(h in [1, 5, 9] for h in owned)
-        has_dusthana = any(h in [6, 8, 12] for h in owned)
-        # Yogakaraka (rules both Kendra and Trikona)
-        if has_kendra and has_trikona and pname not in ["Rahu", "Ketu"]:
-            return True
-        # Trikona lord without dusthana
-        if has_trikona and not has_dusthana:
-            return True
-        # Natural benefic ruling non-dusthana
-        if pname in ["Jupiter", "Venus"] and not has_dusthana:
-            return True
-        return False
-
-    def transit_house_from_lagna(pname: str) -> int:
-        s = transit_signs.get(pname, 1)
-        return ((s - asc_sign) % 12) + 1
-
-    jup_h = transit_house_from_lagna("Jupiter")
-    sat_h = transit_house_from_lagna("Saturn")
-    ven_h = transit_house_from_lagna("Venus")
-    mer_h = transit_house_from_lagna("Mercury")
-    mars_h = transit_house_from_lagna("Mars")
-    sun_h = transit_house_from_lagna("Sun")
-    moon_h = transit_house_from_lagna("Moon")
-
-    # --- ITEM 1: Present Scenario ---
-    present_score = 0.0
-    for l_name, wt in [(md_lord, 2.5), (ad_lord, 2.0), (pd_lord, 1.5)]:
-        if is_functional_benefic(l_name):
-            present_score += wt
-        elif any(h in [6, 8, 12] for h in lord_to_houses.get(l_name, [])):
-            present_score -= wt * 0.7
+        if saturn_dist_from_moon == 12:
+            sade_sati = {"active": True, "phase": "Rising"}
+        elif saturn_dist_from_moon == 1:
+            sade_sati = {"active": True, "phase": "Peak"}
+        elif saturn_dist_from_moon == 2:
+            sade_sati = {"active": True, "phase": "Setting"}
         else:
-            present_score += wt * 0.3
+            sade_sati = {"active": False, "phase": "None"}
 
-        t_h = transit_house_from_lagna(l_name)
-        if t_h in [1, 2, 4, 5, 7, 9, 10, 11]:
-            present_score += 0.8
-        elif t_h in [6, 8, 12]:
-            present_score -= 0.8
+        # 6. House Lordships & Functional Benefic/Malefic Analysis from Ascendant (Lagna)
+        house_to_lord = {}
+        lord_to_houses = {p: [] for p in PLANET_SHORT.keys()}
+        for h in range(1, 13):
+            s_num = ((asc_sign - 1 + (h - 1)) % 12) + 1
+            lord = SIGN_LORDS.get(s_num, "Jupiter")
+            house_to_lord[h] = lord
+            if lord not in lord_to_houses:
+                lord_to_houses[lord] = []
+            lord_to_houses[lord].append(h)
 
-    if jup_h in [1, 2, 4, 5, 7, 9, 10, 11]:
-        present_score += 2.0
-    else:
-        present_score -= 0.5
+        lagna_lord = house_to_lord[1]
 
-    if sat_h in [3, 6, 11]:
-        present_score += 1.5
-    elif sat_h in [1, 8, 12]:
-        present_score -= 1.5
+        def is_functional_benefic(pname: str) -> bool:
+            if pname == lagna_lord:
+                return True
+            owned = lord_to_houses.get(pname, [])
+            has_kendra = any(h in [1, 4, 7, 10] for h in owned)
+            has_trikona = any(h in [1, 5, 9] for h in owned)
+            has_dusthana = any(h in [6, 8, 12] for h in owned)
+            if has_kendra and has_trikona and pname not in ["Rahu", "Ketu"]:
+                return True
+            if has_trikona and not has_dusthana:
+                return True
+            if pname in ["Jupiter", "Venus"] and not has_dusthana:
+                return True
+            return False
 
-    if sade_sati["active"]:
-        if sade_sati["phase"] == "Peak":
-            present_score -= 2.0
-        elif sade_sati["phase"] == "Rising":
-            present_score -= 1.2
+        def transit_house_from_lagna(pname: str) -> int:
+            s = transit_signs.get(pname, 1)
+            try:
+                s_int = int(s)
+            except (ValueError, TypeError):
+                s_int = 1
+            return ((s_int - asc_sign) % 12) + 1
+
+        jup_h = transit_house_from_lagna("Jupiter")
+        sat_h = transit_house_from_lagna("Saturn")
+        ven_h = transit_house_from_lagna("Venus")
+        mer_h = transit_house_from_lagna("Mercury")
+        mars_h = transit_house_from_lagna("Mars")
+        sun_h = transit_house_from_lagna("Sun")
+        moon_h = transit_house_from_lagna("Moon")
+
+        # --- ITEM 1: Present Scenario ---
+        present_score = 0.0
+        for l_name, wt in [(md_lord, 2.5), (ad_lord, 2.0), (pd_lord, 1.5)]:
+            if is_functional_benefic(l_name):
+                present_score += wt
+            elif any(h in [6, 8, 12] for h in lord_to_houses.get(l_name, [])):
+                present_score -= wt * 0.7
+            else:
+                present_score += wt * 0.3
+
+            t_h = transit_house_from_lagna(l_name)
+            if t_h in [1, 2, 4, 5, 7, 9, 10, 11]:
+                present_score += 0.8
+            elif t_h in [6, 8, 12]:
+                present_score -= 0.8
+
+        if jup_h in [1, 2, 4, 5, 7, 9, 10, 11]:
+            present_score += 2.0
         else:
-            present_score -= 0.8
+            present_score -= 0.5
 
-    if present_score >= 1.5:
-        p_status = "favourable"
-        p_badge = "Favourable"
+        if sat_h in [3, 6, 11]:
+            present_score += 1.5
+        elif sat_h in [1, 8, 12]:
+            present_score -= 1.5
+
         if sade_sati["active"]:
-            p_summary = (
-                f"Under your active {md_lord} Mahadasha and {ad_lord} Antardasha, Jupiter's supportive transit in your "
-                f"{ord_suffix(jup_h)} house from Lagna maintains steady progress despite {sade_sati['phase']} Phase Sade Sati. "
-                "Staying centered and disciplined empowers you to turn challenges into long-term strengths."
-            )
+            if sade_sati["phase"] == "Peak":
+                present_score -= 2.0
+            elif sade_sati["phase"] == "Rising":
+                present_score -= 1.2
+            else:
+                present_score -= 0.8
+
+        if present_score >= 1.5:
+            p_status = "favourable"
+            p_badge = "Favourable"
+            if sade_sati["active"]:
+                p_summary = (
+                    f"Under your active {md_lord} Mahadasha and {ad_lord} Antardasha, Jupiter's supportive transit in your "
+                    f"{ord_suffix(jup_h)} house from Lagna maintains steady progress despite {sade_sati['phase']} Phase Sade Sati. "
+                    "Staying centered and disciplined empowers you to turn challenges into long-term strengths."
+                )
+            else:
+                p_summary = (
+                    f"Your running {md_lord}-{ad_lord} Dasha is positively reinforced by Jupiter transiting your "
+                    f"{ord_suffix(jup_h)} house from Lagna, fostering clarity and constructive momentum. "
+                    "Approach your daily responsibilities with quiet confidence as favorable cosmic currents support your path."
+                )
         else:
-            p_summary = (
-                f"Your running {md_lord}-{ad_lord} Dasha is positively reinforced by Jupiter transiting your "
-                f"{ord_suffix(jup_h)} house from Lagna, fostering clarity and constructive momentum. "
-                "Approach your daily responsibilities with quiet confidence as favorable cosmic currents support your path."
-            )
-    else:
-        p_status = "mindful"
-        p_badge = "Mindful Phase"
-        if sade_sati["active"]:
-            p_summary = (
-                f"With active {md_lord}-{ad_lord}-{pd_lord} Dasha and Saturn's {sade_sati['phase']} Phase Sade Sati over natal Moon, "
-                "this period calls for patient reflection, emotional composure, and steady routines. "
-                "Focus on one priority at a time, trusting that measured discipline smoothly navigates this transitional phase."
-            )
+            p_status = "mindful"
+            p_badge = "Mindful Phase"
+            if sade_sati["active"]:
+                p_summary = (
+                    f"With active {md_lord}-{ad_lord}-{pd_lord} Dasha and Saturn's {sade_sati['phase']} Phase Sade Sati over natal Moon, "
+                    "this period calls for patient reflection, emotional composure, and steady routines. "
+                    "Focus on one priority at a time, trusting that measured discipline smoothly navigates this transitional phase."
+                )
+            else:
+                p_summary = (
+                    f"With your active {md_lord}-{ad_lord} Dasha and Saturn transiting your {ord_suffix(sat_h)} house from Lagna, "
+                    "current cosmic currents encourage thoughtful planning over hurried decisions. "
+                    "Grounding yourself in routine and mindfulness brings clarity and lasting stability."
+                )
+
+        # --- ITEM 2: Love Life ---
+        love_score = 0.0
+        if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
+            love_score += 2.0
         else:
-            p_summary = (
-                f"With your active {md_lord}-{ad_lord} Dasha and Saturn transiting your {ord_suffix(sat_h)} house from Lagna, "
-                "current cosmic currents encourage thoughtful planning over hurried decisions. "
-                "Grounding yourself in routine and mindfulness brings clarity and lasting stability."
-            )
+            love_score -= 1.0
 
-    # --- ITEM 2: Love Life ---
-    love_score = 0.0
-    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
-        love_score += 2.0
-    else:
-        love_score -= 1.0
-
-    if jup_h in [1, 5, 7, 9, 11]:
-        love_score += 1.5
-    jup_aspects = [((jup_h - 1 + asp - 1) % 12) + 1 for asp in [5, 7, 9]]
-    if 5 in jup_aspects or 7 in jup_aspects:
-        love_score += 1.5
-
-    h5_lord = house_to_lord[5]
-    h7_lord = house_to_lord[7]
-    for l_name in [md_lord, ad_lord, pd_lord]:
-        if l_name in [h5_lord, h7_lord, "Venus"]:
+        if jup_h in [1, 5, 7, 9, 11]:
             love_score += 1.5
-        elif any(h in [5, 7] for h in lord_to_houses.get(l_name, [])):
-            love_score += 1.0
-
-    if sat_h in [5, 7] or mars_h in [5, 7]:
-        love_score -= 1.5
-    if sade_sati["active"] and sade_sati["phase"] == "Peak":
-        love_score -= 1.0
-
-    if love_score >= 1.5:
-        l_status = "favourable"
-        l_badge = "Favourable"
+        jup_aspects = [((jup_h - 1 + asp - 1) % 12) + 1 for asp in [5, 7, 9]]
         if 5 in jup_aspects or 7 in jup_aspects:
-            l_summary = (
-                f"Venus transiting your {ord_suffix(ven_h)} house and Jupiter's protective aspect on relationship houses "
-                f"harmonize with your {pd_lord} Pratyantardasha, creating sweet opportunities for closeness. "
-                "Heartfelt, compassionate dialogue will naturally deepen mutual warmth and understanding."
-            )
+            love_score += 1.5
+
+        h5_lord = house_to_lord[5]
+        h7_lord = house_to_lord[7]
+        for l_name in [md_lord, ad_lord, pd_lord]:
+            if l_name in [h5_lord, h7_lord, "Venus"]:
+                love_score += 1.5
+            elif any(h in [5, 7] for h in lord_to_houses.get(l_name, [])):
+                love_score += 1.0
+
+        if sat_h in [5, 7] or mars_h in [5, 7]:
+            love_score -= 1.5
+        if sade_sati["active"] and sade_sati["phase"] == "Peak":
+            love_score -= 1.0
+
+        if love_score >= 1.5:
+            l_status = "favourable"
+            l_badge = "Favourable"
+            if 5 in jup_aspects or 7 in jup_aspects:
+                l_summary = (
+                    f"Venus transiting your {ord_suffix(ven_h)} house and Jupiter's protective aspect on relationship houses "
+                    f"harmonize with your {pd_lord} Pratyantardasha, creating sweet opportunities for closeness. "
+                    "Heartfelt, compassionate dialogue will naturally deepen mutual warmth and understanding."
+                )
+            else:
+                l_summary = (
+                    f"Venus transiting your {ord_suffix(ven_h)} house from Lagna blends pleasantly with your active {md_lord}-{ad_lord} Dasha, "
+                    "bringing warmth and tender receptivity to personal connections. "
+                    "Expressing appreciation and shared joy will reinforce harmony in your relationships."
+                )
         else:
-            l_summary = (
-                f"Venus transiting your {ord_suffix(ven_h)} house from Lagna blends pleasantly with your active {md_lord}-{ad_lord} Dasha, "
-                "bringing warmth and tender receptivity to personal connections. "
-                "Expressing appreciation and shared joy will reinforce harmony in your relationships."
-            )
-    else:
-        l_status = "mindful"
-        l_badge = "Mindful Phase"
-        if sade_sati["active"]:
-            l_summary = (
-                f"With {pd_lord} Pratyantardasha running and Saturn's {sade_sati['phase']} Phase Sade Sati, "
-                "relationship matters benefit from gentle patience and empathetic listening. "
-                "Avoid jumping to hasty conclusions, giving each other time and space to nurture mutual trust."
-            )
-        else:
-            l_summary = (
-                f"Planetary transits across relationship axes under your active {md_lord}-{ad_lord} Dasha suggest cultivating "
-                "calm communication and emotional balance. "
-                "Practicing attentive listening prevents unnecessary misunderstandings and keeps your bond serene."
-            )
+            l_status = "mindful"
+            l_badge = "Mindful Phase"
+            if sade_sati["active"]:
+                l_summary = (
+                    f"With {pd_lord} Pratyantardasha running and Saturn's {sade_sati['phase']} Phase Sade Sati, "
+                    "relationship matters benefit from gentle patience and empathetic listening. "
+                    "Avoid jumping to hasty conclusions, giving each other time and space to nurture mutual trust."
+                )
+            else:
+                l_summary = (
+                    f"Planetary transits across relationship axes under your active {md_lord}-{ad_lord} Dasha suggest cultivating "
+                    "calm communication and emotional balance. "
+                    "Practicing attentive listening prevents unnecessary misunderstandings and keeps your bond serene."
+                )
 
-    # --- ITEM 3: Good Time to Buy Vehicle ---
-    veh_score = 0.0
-    h4_lord = house_to_lord[4]
-    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
-        veh_score += 1.5
-    else:
-        veh_score -= 1.0
-
-    if 4 in [jup_h, ven_h]:
-        veh_score += 2.0
-    if 4 == sat_h:
-        veh_score -= 2.0
-    if 4 == mars_h:
-        veh_score -= 1.0
-
-    h4_lord_trans_h = transit_house_from_lagna(h4_lord)
-    if h4_lord_trans_h in [1, 4, 5, 9, 11, 2]:
-        veh_score += 1.5
-    elif h4_lord_trans_h in [6, 8, 12]:
-        veh_score -= 1.5
-
-    for l_name in [md_lord, ad_lord, pd_lord]:
-        if l_name == h4_lord or l_name == "Venus":
+        # --- ITEM 3: Good Time to Buy Vehicle ---
+        veh_score = 0.0
+        h4_lord = house_to_lord[4]
+        if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
             veh_score += 1.5
-        elif 4 in lord_to_houses.get(l_name, []):
-            veh_score += 1.0
+        else:
+            veh_score -= 1.0
 
-    if sade_sati["active"] and sade_sati["phase"] == "Peak":
-        veh_score -= 1.0
+        if 4 in [jup_h, ven_h]:
+            veh_score += 2.0
+        if 4 == sat_h:
+            veh_score -= 2.0
+        if 4 == mars_h:
+            veh_score -= 1.0
 
-    if veh_score >= 1.5:
-        v_status = "favourable"
-        v_badge = "Favourable"
-        v_summary = (
-            f"Favorable activation of your 4th house (Vahana Bhava) and Venus transiting your {ord_suffix(ven_h)} house from Lagna "
-            "indicate an auspicious window for purchasing a vehicle. "
-            "Evaluating practical features and long-term comfort will help you select a dependable conveyance."
-        )
-    else:
-        v_status = "mindful"
-        v_badge = "Mindful Phase"
-        if sat_h == 4 or (sade_sati["active"] and sade_sati["phase"] == "Peak"):
+        h4_lord_trans_h = transit_house_from_lagna(h4_lord)
+        if h4_lord_trans_h in [1, 4, 5, 9, 11, 2]:
+            veh_score += 1.5
+        elif h4_lord_trans_h in [6, 8, 12]:
+            veh_score -= 1.5
+
+        for l_name in [md_lord, ad_lord, pd_lord]:
+            if l_name == h4_lord or l_name == "Venus":
+                veh_score += 1.5
+            elif 4 in lord_to_houses.get(l_name, []):
+                veh_score += 1.0
+
+        if sade_sati["active"] and sade_sati["phase"] == "Peak":
+            veh_score -= 1.0
+
+        if veh_score >= 1.5:
+            v_status = "favourable"
+            v_badge = "Favourable"
             v_summary = (
-                f"With Saturn's cautious transit and active {pd_lord} Pratyantardasha, any vehicle purchase warrants meticulous inspection "
-                "of mechanical condition, pricing, and paperwork. "
-                "Taking time to double-check details avoids unexpected maintenance and safeguards your investment."
+                f"Favorable activation of your 4th house (Vahana Bhava) and Venus transiting your {ord_suffix(ven_h)} house from Lagna "
+                "indicate an auspicious window for purchasing a vehicle. "
+                "Evaluating practical features and long-term comfort will help you select a dependable conveyance."
             )
         else:
-            v_summary = (
-                f"Current planetary transits from your Lagna under the {md_lord}-{ad_lord} Dasha advise taking your time "
-                "rather than rushing into automobile purchases. "
-                "Patient market research will soon reveal a far more satisfying and trouble-free deal."
-            )
+            v_status = "mindful"
+            v_badge = "Mindful Phase"
+            if sat_h == 4 or (sade_sati["active"] and sade_sati["phase"] == "Peak"):
+                v_summary = (
+                    f"With Saturn's cautious transit and active {pd_lord} Pratyantardasha, any vehicle purchase warrants meticulous inspection "
+                    "of mechanical condition, pricing, and paperwork. "
+                    "Taking time to double-check details avoids unexpected maintenance and safeguards your investment."
+                )
+            else:
+                v_summary = (
+                    f"Current planetary transits from your Lagna under the {md_lord}-{ad_lord} Dasha advise taking your time "
+                    "rather than rushing into automobile purchases. "
+                    "Patient market research will soon reveal a far more satisfying and trouble-free deal."
+                )
 
-    # --- ITEM 4: Good Time to Buy Luxury Items ---
-    lux_score = 0.0
-    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
-        lux_score += 2.0
-    else:
-        lux_score -= 1.5
+        # --- ITEM 4: Good Time to Buy Luxury Items ---
+        lux_score = 0.0
+        if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
+            lux_score += 2.0
+        else:
+            lux_score -= 1.5
 
-    if jup_h in [1, 2, 5, 9, 11]:
-        lux_score += 1.5
-
-    h2_lord = house_to_lord[2]
-    h11_lord = house_to_lord[11]
-    for l_name in [md_lord, ad_lord, pd_lord]:
-        if l_name in ["Venus", h2_lord, h11_lord]:
+        if jup_h in [1, 2, 5, 9, 11]:
             lux_score += 1.5
-        elif any(h in [2, 4, 11] for h in lord_to_houses.get(l_name, [])):
-            lux_score += 1.0
 
-    if sat_h in [2, 11]:
-        lux_score -= 1.0
-    if sade_sati["active"]:
-        lux_score -= 1.5
+        h2_lord = house_to_lord[2]
+        h11_lord = house_to_lord[11]
+        for l_name in [md_lord, ad_lord, pd_lord]:
+            if l_name in ["Venus", h2_lord, h11_lord]:
+                lux_score += 1.5
+            elif any(h in [2, 4, 11] for h in lord_to_houses.get(l_name, [])):
+                lux_score += 1.0
 
-    if lux_score >= 1.5:
-        lx_status = "favourable"
-        lx_badge = "Favourable"
-        lx_summary = (
-            f"Venus transiting your {ord_suffix(ven_h)} house from Lagna brings pleasing harmony with your {md_lord}-{ad_lord} Dasha, "
-            "supporting thoughtful purchases that elevate your comfort and lifestyle. "
-            "Choosing enduring craftsmanship over fleeting novelty will provide lasting satisfaction."
-        )
-    else:
-        lx_status = "mindful"
-        lx_badge = "Mindful Phase"
+        if sat_h in [2, 11]:
+            lux_score -= 1.0
         if sade_sati["active"]:
+            lux_score -= 1.5
+
+        if lux_score >= 1.5:
+            lx_status = "favourable"
+            lx_badge = "Favourable"
             lx_summary = (
-                f"With active {pd_lord} Pratyantardasha and Saturn's {sade_sati['phase']} Phase Sade Sati, "
-                "exercising mindful moderation on non-essential luxury items is wise. "
-                "Directing resources toward essentials and savings ensures steady peace of mind."
+                f"Venus transiting your {ord_suffix(ven_h)} house from Lagna brings pleasing harmony with your {md_lord}-{ad_lord} Dasha, "
+                "supporting thoughtful purchases that elevate your comfort and lifestyle. "
+                "Choosing enduring craftsmanship over fleeting novelty will provide lasting satisfaction."
             )
         else:
-            lx_summary = (
-                f"Under current planetary configurations from Lagna and your active {md_lord}-{ad_lord} Dasha, "
-                "prioritizing financial consolidation over extravagant expenses is prudent. "
-                "Thoughtful spending restraint now will safeguard your financial comfort for future opportunities."
-            )
+            lx_status = "mindful"
+            lx_badge = "Mindful Phase"
+            if sade_sati["active"]:
+                lx_summary = (
+                    f"With active {pd_lord} Pratyantardasha and Saturn's {sade_sati['phase']} Phase Sade Sati, "
+                    "exercising mindful moderation on non-essential luxury items is wise. "
+                    "Directing resources toward essentials and savings ensures steady peace of mind."
+                )
+            else:
+                lx_summary = (
+                    f"Under current planetary configurations from Lagna and your active {md_lord}-{ad_lord} Dasha, "
+                    "prioritizing financial consolidation over extravagant expenses is prudent. "
+                    "Thoughtful spending restraint now will safeguard your financial comfort for future opportunities."
+                )
 
-    # --- ITEM 5: Good Time to Buy Share or Investment ---
-    # Evaluating Level-3 Pratyantardasha, transit from Ascendant, 2nd/5th/9th/11th houses, and Sade Sati
-    inv_score = 0.0
+        # --- ITEM 5: Good Time to Buy Share or Investment ---
+        inv_score = 0.0
 
-    # Level-3 PD lord evaluation
-    pd_benefic = is_functional_benefic(pd_lord)
-    if pd_benefic:
-        inv_score += 2.0
+        pd_benefic = is_functional_benefic(pd_lord)
+        if pd_benefic:
+            inv_score += 2.0
 
-    pd_owned = lord_to_houses.get(pd_lord, [])
-    pd_wealth_houses = [h for h in pd_owned if h in [2, 5, 9, 11]]
-    if pd_wealth_houses:
-        inv_score += 1.5 * len(pd_wealth_houses)
-    elif any(h in [6, 8, 12] for h in pd_owned) and not pd_benefic:
-        inv_score -= 2.0
+        pd_owned = lord_to_houses.get(pd_lord, [])
+        pd_wealth_houses = [h for h in pd_owned if h in [2, 5, 9, 11]]
+        if pd_wealth_houses:
+            inv_score += 1.5 * len(pd_wealth_houses)
+        elif any(h in [6, 8, 12] for h in pd_owned) and not pd_benefic:
+            inv_score -= 2.0
 
-    pd_trans_h = transit_house_from_lagna(pd_lord)
-    if pd_trans_h in [1, 2, 5, 9, 10, 11]:
-        inv_score += 1.5
-    elif pd_trans_h in [6, 8, 12]:
-        inv_score -= 1.5
-
-    # Transits from Ascendant for key wealth/speculation karakas
-    if jup_h in [1, 2, 5, 7, 9, 11]:
-        inv_score += 2.0
-    elif jup_h in [6, 8, 12]:
-        inv_score -= 1.0
-
-    if mer_h in [1, 2, 5, 9, 11]:
-        inv_score += 1.0
-
-    # Benefics/malefics transiting in 2nd, 5th, 9th, 11th houses
-    for h in [2, 5, 9, 11]:
-        occ = [p for p in required_planets if transit_house_from_lagna(p) == h]
-        if any(p in ["Jupiter", "Venus", "Mercury"] for p in occ):
-            inv_score += 0.8
-        if "Saturn" in occ and h != 11:
-            inv_score -= 0.8
-        if "Mars" in occ and h not in [3, 6, 10, 11]:
-            inv_score -= 0.6
-
-    # Sade Sati impact on market sentiment and volatility
-    if sade_sati["active"]:
-        if sade_sati["phase"] == "Peak":
-            inv_score -= 2.5
-        elif sade_sati["phase"] == "Rising":
+        pd_trans_h = transit_house_from_lagna(pd_lord)
+        if pd_trans_h in [1, 2, 5, 9, 10, 11]:
+            inv_score += 1.5
+        elif pd_trans_h in [6, 8, 12]:
             inv_score -= 1.5
-        elif sade_sati["phase"] == "Setting":
-            inv_score -= 0.5
 
-    if inv_score >= 1.5:
-        i_status = "favourable"
-        i_badge = "Favourable"
-        wealth_str = ", ".join([ord_suffix(h) for h in pd_wealth_houses]) if pd_wealth_houses else f"{ord_suffix(pd_trans_h)} house"
-        i_summary = (
-            f"Your Level-3 {pd_lord} Pratyantardasha beneficially activates your {wealth_str} from Lagna, "
-            f"while Jupiter transiting your {ord_suffix(jup_h)} house lends positive financial growth. "
-            "Disciplined investments in fundamentally strong equities or funds carry sound long-term reward."
-        )
-    else:
-        i_status = "mindful"
-        i_badge = "Mindful Phase"
+        if jup_h in [1, 2, 5, 7, 9, 11]:
+            inv_score += 2.0
+        elif jup_h in [6, 8, 12]:
+            inv_score -= 1.0
+
+        if mer_h in [1, 2, 5, 9, 11]:
+            inv_score += 1.0
+
+        for h in [2, 5, 9, 11]:
+            occ = [p for p in required_planets if transit_house_from_lagna(p) == h]
+            if any(p in ["Jupiter", "Venus", "Mercury"] for p in occ):
+                inv_score += 0.8
+            if "Saturn" in occ and h != 11:
+                inv_score -= 0.8
+            if "Mars" in occ and h not in [3, 6, 10, 11]:
+                inv_score -= 0.6
+
         if sade_sati["active"]:
+            if sade_sati["phase"] == "Peak":
+                inv_score -= 2.5
+            elif sade_sati["phase"] == "Rising":
+                inv_score -= 1.5
+            elif sade_sati["phase"] == "Setting":
+                inv_score -= 0.5
+
+        if inv_score >= 1.5:
+            i_status = "favourable"
+            i_badge = "Favourable"
+            wealth_str = ", ".join([f"{ord_suffix(h)} house" for h in pd_wealth_houses]) if pd_wealth_houses else f"{ord_suffix(pd_trans_h)} house"
             i_summary = (
-                f"With Level-3 {pd_lord} Pratyantardasha active and Saturn's {sade_sati['phase']} Phase Sade Sati on natal Moon, "
-                "financial markets call for disciplined prudence over speculative trading. "
-                "Favor systematic, diversified savings and avoid high-leverage positions to protect your wealth."
+                f"Your Level-3 {pd_lord} Pratyantardasha beneficially activates your {wealth_str} from Lagna, "
+                f"while Jupiter transiting your {ord_suffix(jup_h)} house lends positive financial growth. "
+                "Disciplined investments in fundamentally strong equities or funds carry sound long-term reward."
             )
         else:
-            i_summary = (
-                f"With your {pd_lord} Pratyantardasha running alongside current planetary transits touching financial houses, "
-                "speculative market bets should be avoided in favor of calm analysis. "
-                "Prioritize capital preservation and systematic, long-horizon instruments for steady stability."
-            )
+            i_status = "mindful"
+            i_badge = "Mindful Phase"
+            if sade_sati["active"]:
+                i_summary = (
+                    f"With Level-3 {pd_lord} Pratyantardasha active and Saturn's {sade_sati['phase']} Phase Sade Sati on natal Moon, "
+                    "financial markets call for disciplined prudence over speculative trading. "
+                    "Favor systematic, diversified savings and avoid high-leverage positions to protect your wealth."
+                )
+            else:
+                i_summary = (
+                    f"With your {pd_lord} Pratyantardasha running alongside current planetary transits touching financial houses, "
+                    "speculative market bets should be avoided in favor of calm analysis. "
+                    "Prioritize capital preservation and systematic, long-horizon instruments for steady stability."
+                )
 
-    items = [
-        {
-            "id": "present_scenario",
-            "title": "Present Scenario",
-            "status": p_status,
-            "badge_label": p_badge,
-            "summary": p_summary
-        },
-        {
-            "id": "love_life",
-            "title": "Love Life",
-            "status": l_status,
-            "badge_label": l_badge,
-            "summary": l_summary
-        },
-        {
-            "id": "good_time_to_buy_vehicle",
-            "title": "Good Time to Buy Vehicle",
-            "status": v_status,
-            "badge_label": v_badge,
-            "summary": v_summary
-        },
-        {
-            "id": "good_time_to_buy_luxury_items",
-            "title": "Good Time to Buy Luxury Items",
-            "status": lx_status,
-            "badge_label": lx_badge,
-            "summary": lx_summary
-        },
-        {
-            "id": "good_time_to_buy_share_or_investment",
-            "title": "Good Time to Buy Share or Investment",
-            "status": i_status,
-            "badge_label": i_badge,
-            "summary": i_summary
+        items = [
+            {
+                "id": "present_scenario",
+                "title": "Present Scenario",
+                "status": p_status,
+                "badge_label": p_badge,
+                "summary": p_summary
+            },
+            {
+                "id": "love_life",
+                "title": "Love Life",
+                "status": l_status,
+                "badge_label": l_badge,
+                "summary": l_summary
+            },
+            {
+                "id": "good_time_to_buy_vehicle",
+                "title": "Good Time to Buy Vehicle",
+                "status": v_status,
+                "badge_label": v_badge,
+                "summary": v_summary
+            },
+            {
+                "id": "good_time_to_buy_luxury_items",
+                "title": "Good Time to Buy Luxury Items",
+                "status": lx_status,
+                "badge_label": lx_badge,
+                "summary": lx_summary
+            },
+            {
+                "id": "good_time_to_buy_share_or_investment",
+                "title": "Good Time to Buy Share or Investment",
+                "status": i_status,
+                "badge_label": i_badge,
+                "summary": i_summary
+            }
+        ]
+
+        return {
+            "generated_at": generated_at,
+            "sade_sati": sade_sati,
+            "active_pratyantardasha": active_pratyantardasha,
+            "items": items
         }
-    ]
-
-    return {
-        "generated_at": generated_at,
-        "sade_sati": sade_sati,
-        "active_pratyantardasha": active_pratyantardasha,
-        "items": items
-    }
+    except Exception as err:
+        print(f"Error evaluating daily outlook: {err}")
+        active_fallback = [md_lord, ad_lord, pd_lord] if 'md_lord' in locals() else None
+        return get_fallback_daily_outlook(active_fallback, query_dt)
 
 @app.post("/api/kundali")
 @app.post("/kundali")
 def generate_kundali(data: BirthInput):
-    coords = resolve_place_coordinates(data.place)
-    if not coords:
-        raise HTTPException(status_code=400, detail=f"Could not resolve coordinates for '{data.place}'.")
-    lat, lon, resolved_address = coords
-    tz_name = tf.timezone_at(lat=lat, lng=lon) or "Asia/Kolkata"
-    local_tz = pytz.timezone(tz_name)
+    # 1. Flexible Coordinates & Place Resolution
+    lat = None
+    lon = None
+    resolved_address = getattr(data, "place", None) or "New Delhi, Delhi, India"
 
-    naive_dt = datetime.strptime(f"{data.dob} {data.tob}", "%Y-%m-%d %H:%M")
+    raw_lat = getattr(data, "lat", None) if getattr(data, "lat", None) is not None else getattr(data, "latitude", None)
+    raw_lon = getattr(data, "lon", None) if getattr(data, "lon", None) is not None else (getattr(data, "longitude", None) if getattr(data, "longitude", None) is not None else getattr(data, "lng", None))
+
+    if raw_lat is not None and raw_lon is not None:
+        try:
+            lat = float(raw_lat)
+            lon = float(raw_lon)
+        except (ValueError, TypeError):
+            lat, lon = None, None
+
+    if (lat is None or lon is None) and getattr(data, "place", None):
+        try:
+            coords = resolve_place_coordinates(str(data.place))
+            if coords:
+                lat, lon, resolved_address = coords
+        except Exception:
+            pass
+
+    if lat is None or lon is None:
+        lat, lon, resolved_address = 28.6139, 77.2090, getattr(data, "place", None) or "New Delhi, Delhi, India"
+
+    # 2. Timezone resolution
+    tz_name = getattr(data, "timezone", None) or getattr(data, "tz", None)
+    if not tz_name:
+        try:
+            tz_name = tf.timezone_at(lat=lat, lng=lon)
+        except Exception:
+            tz_name = None
+    if not tz_name:
+        tz_name = "Asia/Kolkata"
+
+    try:
+        local_tz = pytz.timezone(tz_name)
+    except Exception:
+        local_tz = pytz.timezone("Asia/Kolkata")
+        tz_name = "Asia/Kolkata"
+
+    # 3. Robust Date & Time parsing
+    dob_str = str(getattr(data, "dob", "1990-01-01")).strip()
+    tob_str = str(getattr(data, "tob", "12:00")).strip()
+    if "/" in dob_str:
+        parts = dob_str.split("/")
+        if len(parts) == 3 and len(parts[0]) == 4:
+            dob_str = f"{parts[0]}-{parts[1]}-{parts[2]}"
+        elif len(parts) == 3:
+            dob_str = f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+    naive_dt = None
+    for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p"]:
+        try:
+            naive_dt = datetime.strptime(f"{dob_str} {tob_str}", fmt)
+            break
+        except ValueError:
+            pass
+
+    if naive_dt is None:
+        try:
+            clean_tob = tob_str.split()[0][:5]
+            naive_dt = datetime.strptime(f"{dob_str} {clean_tob}", "%Y-%m-%d %H:%M")
+        except Exception:
+            naive_dt = datetime(1990, 1, 1, 12, 0)
+
     local_dt = local_tz.localize(naive_dt)
     utc_dt = local_dt.astimezone(pytz.utc)
 
@@ -1423,20 +1596,25 @@ def generate_kundali(data: BirthInput):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist_tz)
 
-    daily_outlook = compute_daily_outlook(
-        natal_data=natal_snap,
-        transit_data=delhi_snap,
-        dasha_tree=active_dasha_chain,
-        query_datetime=now_ist
-    )
+    # Defensive execution of compute_daily_outlook with try / except
+    try:
+        daily_outlook = compute_daily_outlook(
+            natal_data=natal_snap,
+            transit_data=delhi_snap,
+            dasha_tree=active_dasha_chain,
+            query_datetime=now_ist
+        )
+    except Exception as e:
+        print(f"Error computing daily outlook: {e}")
+        daily_outlook = get_fallback_daily_outlook(active_dasha_4, now_ist)
 
     sookshma_summary = f"{active_dasha_4[0]} MD / {active_dasha_4[1]} AD / {active_dasha_4[2]} PD / {active_dasha_4[3]} SD"
 
     payload = {
         "profile": {
-            "name": data.name,
-            "dob": data.dob,
-            "tob": data.tob,
+            "name": getattr(data, "name", "User") or "User",
+            "dob": dob_str,
+            "tob": tob_str,
             "place": resolved_address,
             "timezone": tz_name,
             "ascendant": f"{ZODIAC_SIGNS[d1_asc_sign - 1]} (Lord: {SIGN_LORDS[d1_asc_sign]})",
@@ -1473,8 +1651,9 @@ def generate_kundali(data: BirthInput):
         "active_dasha_4": active_dasha_4
     }
 
-    CHART_STORE[data.name.lower()] = payload
-    return payload
+    user_key = (getattr(data, "name", "user") or "user").lower()
+    CHART_STORE[user_key] = payload
+    return sanitize_for_json(payload)
 
 @app.post("/api/dasha-sublevels")
 @app.post("/dasha-sublevels")
