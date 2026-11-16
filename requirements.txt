@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-jyotishganit
+pysweph
 geopy
 timezonefinder
 pytz
 google-genai
+pydantic
 python-dotenv

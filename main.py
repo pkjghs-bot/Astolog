@@ -1,8 +1,16 @@
 import os
+import json
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import pytz
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -12,17 +20,23 @@ from timezonefinder import TimezoneFinder
 from google import genai
 from google.genai import types
 
-load_dotenv()
-
 # Optional Swiss Ephemeris import with pure-python fallback via jyotishganit
 try:
     import swisseph as swe
     HAS_SWISSEPH = True
     swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
 except ImportError:
-    swe = None
-    HAS_SWISSEPH = False
-    from jyotishganit import calculate_birth_chart
+    try:
+        import pysweph as swe
+        HAS_SWISSEPH = True
+        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+    except ImportError:
+        swe = None
+        HAS_SWISSEPH = False
+        try:
+            from jyotishganit import calculate_birth_chart
+        except ImportError:
+            calculate_birth_chart = None
 
 app = FastAPI(title="Astolog — Vedic Kundali & Agentic AI Engine")
 
@@ -197,13 +211,15 @@ class DashaExpandRequest(BaseModel):
 DashaSublevelsRequest = DashaExpandRequest
 
 class TransitRequest(BaseModel):
-    session_id: str
     transit_date: str  # YYYY-MM-DD
     transit_time: str  # HH:MM (24-hour IST)
+    natal_meta: Optional[dict] = None
+    session_id: Optional[str] = None
 
 class AgentQuery(BaseModel):
-    session_id: str
     question: str
+    context_data: Optional[dict] = None
+    session_id: Optional[str] = None
 
 def get_nakshatra_info(abs_deg: float):
     abs_deg = abs_deg % 360.0
@@ -772,38 +788,583 @@ def build_active_dasha_chain(mahadashas: List[dict], target_dt: datetime) -> Lis
     return chain
 
 @app.get("/")
-@app.get("/index-5")
-@app.get("/index-5.html")
-def serve_frontend_index5():
-    return FileResponse("index-5.html")
-
-@app.get("/index-4")
-@app.get("/index-4.html")
-def serve_frontend_index4():
-    return FileResponse("index-4.html")
-
-@app.get("/index-3")
-@app.get("/index-3.html")
-def serve_frontend_index3():
-    return FileResponse("index-3.html")
-
-@app.get("/index-1")
-@app.get("/index-1.html")
-def serve_frontend_index1():
-    return FileResponse("index-1.html")
-
 @app.get("/index")
 @app.get("/index.html")
-def serve_frontend_index():
+@app.get("/index-5")
+@app.get("/index-5.html")
+def serve_frontend():
+    for f in ["index.html", "index-5.html"]:
+        if os.path.exists(f):
+            return FileResponse(f)
     return FileResponse("index.html")
 
-@app.post("/api/kundali")
-def generate_kundali(data: BirthInput):
-    location = geolocator.geocode(data.place)
-    if not location:
-        raise HTTPException(status_code=400, detail="Place of birth not found.")
+# Instant zero-network lookup for major Indian cities
+INDIA_CITIES = {
+    "patna": (25.5941, 85.1376, "Patna, Bihar, India"),
+    "new delhi": (28.6139, 77.2090, "New Delhi, Delhi, India"),
+    "delhi": (28.7041, 77.1025, "Delhi, India"),
+    "mumbai": (19.0760, 72.8777, "Mumbai, Maharashtra, India"),
+    "pune": (18.5204, 73.8567, "Pune, Maharashtra, India"),
+    "kolkata": (22.5726, 88.3639, "Kolkata, West Bengal, India"),
+    "bengaluru": (12.9716, 77.5946, "Bengaluru, Karnataka, India"),
+    "bangalore": (12.9716, 77.5946, "Bengaluru, Karnataka, India"),
+    "chennai": (13.0827, 80.2707, "Chennai, Tamil Nadu, India"),
+    "hyderabad": (17.3850, 78.4867, "Hyderabad, Telangana, India"),
+    "guwahati": (26.1445, 91.7362, "Guwahati, Assam, India"),
+    "silchar": (24.8333, 92.7789, "Silchar, Assam, India"),
+    "varanasi": (25.3176, 82.9739, "Varanasi, Uttar Pradesh, India"),
+    "lucknow": (26.8467, 80.9462, "Lucknow, Uttar Pradesh, India"),
+    "jaipur": (26.9124, 75.7873, "Jaipur, Rajasthan, India"),
+    "ahmedabad": (23.0225, 72.5714, "Ahmedabad, Gujarat, India"),
+    "ranchi": (23.3441, 85.3096, "Ranchi, Jharkhand, India"),
+    "bhopal": (23.2599, 77.4126, "Bhopal, Madhya Pradesh, India"),
+    "chandigarh": (30.7333, 76.7794, "Chandigarh, India"),
+    "bhubaneswar": (20.2961, 85.8245, "Bhubaneswar, Odisha, India"),
+}
 
-    lat, lon = location.latitude, location.longitude
+def resolve_place_coordinates(place_str: str):
+    cleaned = place_str.strip().lower()
+    city_key = cleaned.split(",")[0].strip()
+    if city_key in INDIA_CITIES:
+        return INDIA_CITIES[city_key]
+
+    # Fallback 1: Open-Meteo Geocoding API (Fast, free, never blocks Vercel/AWS IPs)
+    try:
+        q = urllib.parse.quote(city_key)
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=en&format=json"
+        req = urllib.request.Request(url, headers={"User-Agent": "AstologApp/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get("results"):
+                r = payload["results"][0]
+                full_name = f"{r.get('name')}, {r.get('admin1', '')}, {r.get('country', '')}".replace(", ,", ",")
+                return float(r["latitude"]), float(r["longitude"]), full_name
+    except Exception:
+        pass
+
+    # Fallback 2: Geopy Nominatim
+    try:
+        loc = geolocator.geocode(place_str, timeout=6)
+        if loc:
+            return loc.latitude, loc.longitude, loc.address
+    except Exception:
+        pass
+
+    return None
+
+def ord_suffix(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+def compute_daily_outlook(natal_data: Any, transit_data: Any, dasha_tree: Any, query_datetime: Any = None) -> Dict[str, Any]:
+    """
+    Evaluates daily outlook based on:
+    1. Active Vimshottari Dasha up to Level 3 (MD -> AD -> PD) and functional nature/house lordship from Lagna.
+    2. Current Planetary Transits counted by house from Ascendant (Lagna) (Jupiter, Saturn, Venus, Mercury, Mars, Sun, Moon).
+    3. Sade Sati Check: house distance of transit Saturn from natal Moon (12th=Rising, 1st=Peak, 2nd=Setting, else None).
+    Returns a dictionary containing generated_at, sade_sati, active_pratyantardasha, and 5 categorized outlook items.
+    """
+    if query_datetime is None:
+        ist_tz = pytz.timezone("Asia/Kolkata")
+        query_dt = datetime.now(ist_tz)
+    elif isinstance(query_datetime, str):
+        try:
+            query_dt = datetime.fromisoformat(query_datetime)
+        except Exception:
+            ist_tz = pytz.timezone("Asia/Kolkata")
+            query_dt = datetime.now(ist_tz)
+    else:
+        query_dt = query_datetime
+
+    # Format timestamp
+    if hasattr(query_dt, "strftime"):
+        if getattr(query_dt, "tzinfo", None) is not None:
+            generated_at = query_dt.strftime("%Y-%m-%d %H:%M %Z")
+        else:
+            generated_at = query_dt.strftime("%Y-%m-%d %H:%M IST")
+    else:
+        generated_at = str(query_dt)
+
+    # 1. Extract Ascendant (Lagna) Sign (1-12)
+    asc_sign = None
+    if isinstance(natal_data, dict):
+        asc_sign = natal_data.get("asc_sign") or natal_data.get("d1_asc_sign")
+        if not asc_sign and "natal_meta" in natal_data:
+            asc_sign = natal_data["natal_meta"].get("d1_asc_sign")
+        if not asc_sign and "asc_abs_deg" in natal_data:
+            asc_sign = int(natal_data["asc_abs_deg"] // 30.0) + 1
+    if not asc_sign:
+        asc_sign = 1
+
+    # 2. Extract Natal Moon Sign (1-12)
+    moon_sign = None
+    if isinstance(natal_data, dict):
+        moon_sign = natal_data.get("moon_sign") or natal_data.get("natal_moon_sign")
+        if not moon_sign and "natal_meta" in natal_data:
+            moon_sign = natal_data["natal_meta"].get("natal_moon_sign")
+        if not moon_sign:
+            raw_planets = natal_data.get("raw_planets", {})
+            if "Moon" in raw_planets:
+                moon_deg = raw_planets["Moon"].get("abs_deg", 0.0)
+                moon_sign = int(moon_deg // 30.0) + 1
+    if not moon_sign:
+        moon_sign = 1
+
+    # 3. Extract Transit Signs for key Grahas
+    transit_signs = {}
+    if isinstance(transit_data, dict):
+        if "raw_planets" in transit_data:
+            for p, info in transit_data["raw_planets"].items():
+                transit_signs[p] = int(info["abs_deg"] // 30.0) + 1
+        elif any(k in transit_data for k in ["Jupiter", "Saturn", "Sun"]):
+            for k, v in transit_data.items():
+                if isinstance(v, int):
+                    transit_signs[k] = v
+                elif isinstance(v, dict) and "abs_deg" in v:
+                    transit_signs[k] = int(v["abs_deg"] // 30.0) + 1
+                elif isinstance(v, dict) and "sign_num" in v:
+                    transit_signs[k] = int(v["sign_num"])
+        elif "table" in transit_data and isinstance(transit_data["table"], list):
+            for row in transit_data["table"]:
+                pname = row.get("planet")
+                snum = row.get("sign_num")
+                if pname and snum:
+                    transit_signs[pname] = int(snum)
+
+    required_planets = ["Jupiter", "Saturn", "Venus", "Mercury", "Mars", "Sun", "Moon"]
+    if any(p not in transit_signs for p in required_planets):
+        now_utc = datetime.now(pytz.utc)
+        fallback_snap = calculate_sidereal_snapshot(now_utc, 28.6139, 77.2090)
+        for p, info in fallback_snap["raw_planets"].items():
+            if p not in transit_signs:
+                transit_signs[p] = int(info["abs_deg"] // 30.0) + 1
+
+    # 4. Extract Active Vimshottari Dasha up to Level 3 (MD -> AD -> PD)
+    md_lord, ad_lord, pd_lord = "Jupiter", "Saturn", "Mercury"
+    if isinstance(dasha_tree, list) and len(dasha_tree) > 0:
+        if "active_lord" in dasha_tree[0]:
+            md_lord = dasha_tree[0]["active_lord"]
+            ad_lord = dasha_tree[1]["active_lord"] if len(dasha_tree) > 1 else md_lord
+            pd_lord = dasha_tree[2]["active_lord"] if len(dasha_tree) > 2 else ad_lord
+        elif "mahadasha" in dasha_tree[0] or "lord" in dasha_tree[0]:
+            target_naive = query_dt.replace(tzinfo=None) if getattr(query_dt, "tzinfo", None) else query_dt
+            chain = build_active_dasha_chain(dasha_tree, target_naive)
+            if len(chain) > 0: md_lord = chain[0]["active_lord"]
+            if len(chain) > 1: ad_lord = chain[1]["active_lord"]
+            if len(chain) > 2: pd_lord = chain[2]["active_lord"]
+        elif isinstance(dasha_tree[0], str):
+            md_lord = dasha_tree[0]
+            ad_lord = dasha_tree[1] if len(dasha_tree) > 1 else md_lord
+            pd_lord = dasha_tree[2] if len(dasha_tree) > 2 else ad_lord
+
+    active_pratyantardasha = f"{md_lord} - {ad_lord} - {pd_lord}"
+
+    # 5. Sade Sati Check from natal Moon
+    # Compute house distance of current transit Saturn from natal Moon (12th=Rising, 1st=Peak, 2nd=Setting; else Inactive)
+    sat_sign = transit_signs.get("Saturn", 11)
+    saturn_dist_from_moon = ((sat_sign - moon_sign) % 12) + 1
+
+    if saturn_dist_from_moon == 12:
+        sade_sati = {"active": True, "phase": "Rising"}
+    elif saturn_dist_from_moon == 1:
+        sade_sati = {"active": True, "phase": "Peak"}
+    elif saturn_dist_from_moon == 2:
+        sade_sati = {"active": True, "phase": "Setting"}
+    else:
+        sade_sati = {"active": False, "phase": "None"}
+
+    # 6. House Lordships & Functional Benefic/Malefic Analysis from Ascendant (Lagna)
+    house_to_lord = {}
+    lord_to_houses = {p: [] for p in PLANET_SHORT.keys()}
+    for h in range(1, 13):
+        s_num = ((asc_sign - 1 + (h - 1)) % 12) + 1
+        lord = SIGN_LORDS[s_num]
+        house_to_lord[h] = lord
+        lord_to_houses[lord].append(h)
+
+    lagna_lord = house_to_lord[1]
+
+    def is_functional_benefic(pname: str) -> bool:
+        if pname == lagna_lord:
+            return True
+        owned = lord_to_houses.get(pname, [])
+        has_kendra = any(h in [1, 4, 7, 10] for h in owned)
+        has_trikona = any(h in [1, 5, 9] for h in owned)
+        has_dusthana = any(h in [6, 8, 12] for h in owned)
+        # Yogakaraka (rules both Kendra and Trikona)
+        if has_kendra and has_trikona and pname not in ["Rahu", "Ketu"]:
+            return True
+        # Trikona lord without dusthana
+        if has_trikona and not has_dusthana:
+            return True
+        # Natural benefic ruling non-dusthana
+        if pname in ["Jupiter", "Venus"] and not has_dusthana:
+            return True
+        return False
+
+    def transit_house_from_lagna(pname: str) -> int:
+        s = transit_signs.get(pname, 1)
+        return ((s - asc_sign) % 12) + 1
+
+    jup_h = transit_house_from_lagna("Jupiter")
+    sat_h = transit_house_from_lagna("Saturn")
+    ven_h = transit_house_from_lagna("Venus")
+    mer_h = transit_house_from_lagna("Mercury")
+    mars_h = transit_house_from_lagna("Mars")
+    sun_h = transit_house_from_lagna("Sun")
+    moon_h = transit_house_from_lagna("Moon")
+
+    # --- ITEM 1: Present Scenario ---
+    present_score = 0.0
+    for l_name, wt in [(md_lord, 2.5), (ad_lord, 2.0), (pd_lord, 1.5)]:
+        if is_functional_benefic(l_name):
+            present_score += wt
+        elif any(h in [6, 8, 12] for h in lord_to_houses.get(l_name, [])):
+            present_score -= wt * 0.7
+        else:
+            present_score += wt * 0.3
+
+        t_h = transit_house_from_lagna(l_name)
+        if t_h in [1, 2, 4, 5, 7, 9, 10, 11]:
+            present_score += 0.8
+        elif t_h in [6, 8, 12]:
+            present_score -= 0.8
+
+    if jup_h in [1, 2, 4, 5, 7, 9, 10, 11]:
+        present_score += 2.0
+    else:
+        present_score -= 0.5
+
+    if sat_h in [3, 6, 11]:
+        present_score += 1.5
+    elif sat_h in [1, 8, 12]:
+        present_score -= 1.5
+
+    if sade_sati["active"]:
+        if sade_sati["phase"] == "Peak":
+            present_score -= 2.0
+        elif sade_sati["phase"] == "Rising":
+            present_score -= 1.2
+        else:
+            present_score -= 0.8
+
+    if present_score >= 1.5:
+        p_status = "favourable"
+        p_badge = "Favourable"
+        if sade_sati["active"]:
+            p_summary = (
+                f"Under your active {md_lord} Mahadasha and {ad_lord} Antardasha, Jupiter's supportive transit in your "
+                f"{ord_suffix(jup_h)} house from Lagna maintains steady progress despite {sade_sati['phase']} Phase Sade Sati. "
+                "Staying centered and disciplined empowers you to turn challenges into long-term strengths."
+            )
+        else:
+            p_summary = (
+                f"Your running {md_lord}-{ad_lord} Dasha is positively reinforced by Jupiter transiting your "
+                f"{ord_suffix(jup_h)} house from Lagna, fostering clarity and constructive momentum. "
+                "Approach your daily responsibilities with quiet confidence as favorable cosmic currents support your path."
+            )
+    else:
+        p_status = "mindful"
+        p_badge = "Mindful Phase"
+        if sade_sati["active"]:
+            p_summary = (
+                f"With active {md_lord}-{ad_lord}-{pd_lord} Dasha and Saturn's {sade_sati['phase']} Phase Sade Sati over natal Moon, "
+                "this period calls for patient reflection, emotional composure, and steady routines. "
+                "Focus on one priority at a time, trusting that measured discipline smoothly navigates this transitional phase."
+            )
+        else:
+            p_summary = (
+                f"With your active {md_lord}-{ad_lord} Dasha and Saturn transiting your {ord_suffix(sat_h)} house from Lagna, "
+                "current cosmic currents encourage thoughtful planning over hurried decisions. "
+                "Grounding yourself in routine and mindfulness brings clarity and lasting stability."
+            )
+
+    # --- ITEM 2: Love Life ---
+    love_score = 0.0
+    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
+        love_score += 2.0
+    else:
+        love_score -= 1.0
+
+    if jup_h in [1, 5, 7, 9, 11]:
+        love_score += 1.5
+    jup_aspects = [((jup_h - 1 + asp - 1) % 12) + 1 for asp in [5, 7, 9]]
+    if 5 in jup_aspects or 7 in jup_aspects:
+        love_score += 1.5
+
+    h5_lord = house_to_lord[5]
+    h7_lord = house_to_lord[7]
+    for l_name in [md_lord, ad_lord, pd_lord]:
+        if l_name in [h5_lord, h7_lord, "Venus"]:
+            love_score += 1.5
+        elif any(h in [5, 7] for h in lord_to_houses.get(l_name, [])):
+            love_score += 1.0
+
+    if sat_h in [5, 7] or mars_h in [5, 7]:
+        love_score -= 1.5
+    if sade_sati["active"] and sade_sati["phase"] == "Peak":
+        love_score -= 1.0
+
+    if love_score >= 1.5:
+        l_status = "favourable"
+        l_badge = "Favourable"
+        if 5 in jup_aspects or 7 in jup_aspects:
+            l_summary = (
+                f"Venus transiting your {ord_suffix(ven_h)} house and Jupiter's protective aspect on relationship houses "
+                f"harmonize with your {pd_lord} Pratyantardasha, creating sweet opportunities for closeness. "
+                "Heartfelt, compassionate dialogue will naturally deepen mutual warmth and understanding."
+            )
+        else:
+            l_summary = (
+                f"Venus transiting your {ord_suffix(ven_h)} house from Lagna blends pleasantly with your active {md_lord}-{ad_lord} Dasha, "
+                "bringing warmth and tender receptivity to personal connections. "
+                "Expressing appreciation and shared joy will reinforce harmony in your relationships."
+            )
+    else:
+        l_status = "mindful"
+        l_badge = "Mindful Phase"
+        if sade_sati["active"]:
+            l_summary = (
+                f"With {pd_lord} Pratyantardasha running and Saturn's {sade_sati['phase']} Phase Sade Sati, "
+                "relationship matters benefit from gentle patience and empathetic listening. "
+                "Avoid jumping to hasty conclusions, giving each other time and space to nurture mutual trust."
+            )
+        else:
+            l_summary = (
+                f"Planetary transits across relationship axes under your active {md_lord}-{ad_lord} Dasha suggest cultivating "
+                "calm communication and emotional balance. "
+                "Practicing attentive listening prevents unnecessary misunderstandings and keeps your bond serene."
+            )
+
+    # --- ITEM 3: Good Time to Buy Vehicle ---
+    veh_score = 0.0
+    h4_lord = house_to_lord[4]
+    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
+        veh_score += 1.5
+    else:
+        veh_score -= 1.0
+
+    if 4 in [jup_h, ven_h]:
+        veh_score += 2.0
+    if 4 == sat_h:
+        veh_score -= 2.0
+    if 4 == mars_h:
+        veh_score -= 1.0
+
+    h4_lord_trans_h = transit_house_from_lagna(h4_lord)
+    if h4_lord_trans_h in [1, 4, 5, 9, 11, 2]:
+        veh_score += 1.5
+    elif h4_lord_trans_h in [6, 8, 12]:
+        veh_score -= 1.5
+
+    for l_name in [md_lord, ad_lord, pd_lord]:
+        if l_name == h4_lord or l_name == "Venus":
+            veh_score += 1.5
+        elif 4 in lord_to_houses.get(l_name, []):
+            veh_score += 1.0
+
+    if sade_sati["active"] and sade_sati["phase"] == "Peak":
+        veh_score -= 1.0
+
+    if veh_score >= 1.5:
+        v_status = "favourable"
+        v_badge = "Favourable"
+        v_summary = (
+            f"Favorable activation of your 4th house (Vahana Bhava) and Venus transiting your {ord_suffix(ven_h)} house from Lagna "
+            "indicate an auspicious window for purchasing a vehicle. "
+            "Evaluating practical features and long-term comfort will help you select a dependable conveyance."
+        )
+    else:
+        v_status = "mindful"
+        v_badge = "Mindful Phase"
+        if sat_h == 4 or (sade_sati["active"] and sade_sati["phase"] == "Peak"):
+            v_summary = (
+                f"With Saturn's cautious transit and active {pd_lord} Pratyantardasha, any vehicle purchase warrants meticulous inspection "
+                "of mechanical condition, pricing, and paperwork. "
+                "Taking time to double-check details avoids unexpected maintenance and safeguards your investment."
+            )
+        else:
+            v_summary = (
+                f"Current planetary transits from your Lagna under the {md_lord}-{ad_lord} Dasha advise taking your time "
+                "rather than rushing into automobile purchases. "
+                "Patient market research will soon reveal a far more satisfying and trouble-free deal."
+            )
+
+    # --- ITEM 4: Good Time to Buy Luxury Items ---
+    lux_score = 0.0
+    if ven_h in [1, 2, 4, 5, 7, 9, 11, 12]:
+        lux_score += 2.0
+    else:
+        lux_score -= 1.5
+
+    if jup_h in [1, 2, 5, 9, 11]:
+        lux_score += 1.5
+
+    h2_lord = house_to_lord[2]
+    h11_lord = house_to_lord[11]
+    for l_name in [md_lord, ad_lord, pd_lord]:
+        if l_name in ["Venus", h2_lord, h11_lord]:
+            lux_score += 1.5
+        elif any(h in [2, 4, 11] for h in lord_to_houses.get(l_name, [])):
+            lux_score += 1.0
+
+    if sat_h in [2, 11]:
+        lux_score -= 1.0
+    if sade_sati["active"]:
+        lux_score -= 1.5
+
+    if lux_score >= 1.5:
+        lx_status = "favourable"
+        lx_badge = "Favourable"
+        lx_summary = (
+            f"Venus transiting your {ord_suffix(ven_h)} house from Lagna brings pleasing harmony with your {md_lord}-{ad_lord} Dasha, "
+            "supporting thoughtful purchases that elevate your comfort and lifestyle. "
+            "Choosing enduring craftsmanship over fleeting novelty will provide lasting satisfaction."
+        )
+    else:
+        lx_status = "mindful"
+        lx_badge = "Mindful Phase"
+        if sade_sati["active"]:
+            lx_summary = (
+                f"With active {pd_lord} Pratyantardasha and Saturn's {sade_sati['phase']} Phase Sade Sati, "
+                "exercising mindful moderation on non-essential luxury items is wise. "
+                "Directing resources toward essentials and savings ensures steady peace of mind."
+            )
+        else:
+            lx_summary = (
+                f"Under current planetary configurations from Lagna and your active {md_lord}-{ad_lord} Dasha, "
+                "prioritizing financial consolidation over extravagant expenses is prudent. "
+                "Thoughtful spending restraint now will safeguard your financial comfort for future opportunities."
+            )
+
+    # --- ITEM 5: Good Time to Buy Share or Investment ---
+    # Evaluating Level-3 Pratyantardasha, transit from Ascendant, 2nd/5th/9th/11th houses, and Sade Sati
+    inv_score = 0.0
+
+    # Level-3 PD lord evaluation
+    pd_benefic = is_functional_benefic(pd_lord)
+    if pd_benefic:
+        inv_score += 2.0
+
+    pd_owned = lord_to_houses.get(pd_lord, [])
+    pd_wealth_houses = [h for h in pd_owned if h in [2, 5, 9, 11]]
+    if pd_wealth_houses:
+        inv_score += 1.5 * len(pd_wealth_houses)
+    elif any(h in [6, 8, 12] for h in pd_owned) and not pd_benefic:
+        inv_score -= 2.0
+
+    pd_trans_h = transit_house_from_lagna(pd_lord)
+    if pd_trans_h in [1, 2, 5, 9, 10, 11]:
+        inv_score += 1.5
+    elif pd_trans_h in [6, 8, 12]:
+        inv_score -= 1.5
+
+    # Transits from Ascendant for key wealth/speculation karakas
+    if jup_h in [1, 2, 5, 7, 9, 11]:
+        inv_score += 2.0
+    elif jup_h in [6, 8, 12]:
+        inv_score -= 1.0
+
+    if mer_h in [1, 2, 5, 9, 11]:
+        inv_score += 1.0
+
+    # Benefics/malefics transiting in 2nd, 5th, 9th, 11th houses
+    for h in [2, 5, 9, 11]:
+        occ = [p for p in required_planets if transit_house_from_lagna(p) == h]
+        if any(p in ["Jupiter", "Venus", "Mercury"] for p in occ):
+            inv_score += 0.8
+        if "Saturn" in occ and h != 11:
+            inv_score -= 0.8
+        if "Mars" in occ and h not in [3, 6, 10, 11]:
+            inv_score -= 0.6
+
+    # Sade Sati impact on market sentiment and volatility
+    if sade_sati["active"]:
+        if sade_sati["phase"] == "Peak":
+            inv_score -= 2.5
+        elif sade_sati["phase"] == "Rising":
+            inv_score -= 1.5
+        elif sade_sati["phase"] == "Setting":
+            inv_score -= 0.5
+
+    if inv_score >= 1.5:
+        i_status = "favourable"
+        i_badge = "Favourable"
+        wealth_str = ", ".join([ord_suffix(h) for h in pd_wealth_houses]) if pd_wealth_houses else f"{ord_suffix(pd_trans_h)} house"
+        i_summary = (
+            f"Your Level-3 {pd_lord} Pratyantardasha beneficially activates your {wealth_str} from Lagna, "
+            f"while Jupiter transiting your {ord_suffix(jup_h)} house lends positive financial growth. "
+            "Disciplined investments in fundamentally strong equities or funds carry sound long-term reward."
+        )
+    else:
+        i_status = "mindful"
+        i_badge = "Mindful Phase"
+        if sade_sati["active"]:
+            i_summary = (
+                f"With Level-3 {pd_lord} Pratyantardasha active and Saturn's {sade_sati['phase']} Phase Sade Sati on natal Moon, "
+                "financial markets call for disciplined prudence over speculative trading. "
+                "Favor systematic, diversified savings and avoid high-leverage positions to protect your wealth."
+            )
+        else:
+            i_summary = (
+                f"With your {pd_lord} Pratyantardasha running alongside current planetary transits touching financial houses, "
+                "speculative market bets should be avoided in favor of calm analysis. "
+                "Prioritize capital preservation and systematic, long-horizon instruments for steady stability."
+            )
+
+    items = [
+        {
+            "id": "present_scenario",
+            "title": "Present Scenario",
+            "status": p_status,
+            "badge_label": p_badge,
+            "summary": p_summary
+        },
+        {
+            "id": "love_life",
+            "title": "Love Life",
+            "status": l_status,
+            "badge_label": l_badge,
+            "summary": l_summary
+        },
+        {
+            "id": "good_time_to_buy_vehicle",
+            "title": "Good Time to Buy Vehicle",
+            "status": v_status,
+            "badge_label": v_badge,
+            "summary": v_summary
+        },
+        {
+            "id": "good_time_to_buy_luxury_items",
+            "title": "Good Time to Buy Luxury Items",
+            "status": lx_status,
+            "badge_label": lx_badge,
+            "summary": lx_summary
+        },
+        {
+            "id": "good_time_to_buy_share_or_investment",
+            "title": "Good Time to Buy Share or Investment",
+            "status": i_status,
+            "badge_label": i_badge,
+            "summary": i_summary
+        }
+    ]
+
+    return {
+        "generated_at": generated_at,
+        "sade_sati": sade_sati,
+        "active_pratyantardasha": active_pratyantardasha,
+        "items": items
+    }
+
+@app.post("/api/kundali")
+@app.post("/kundali")
+def generate_kundali(data: BirthInput):
+    coords = resolve_place_coordinates(data.place)
+    if not coords:
+        raise HTTPException(status_code=400, detail=f"Could not resolve coordinates for '{data.place}'.")
+    lat, lon, resolved_address = coords
     tz_name = tf.timezone_at(lat=lat, lng=lon) or "Asia/Kolkata"
     local_tz = pytz.timezone(tz_name)
 
@@ -862,6 +1423,13 @@ def generate_kundali(data: BirthInput):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist_tz)
 
+    daily_outlook = compute_daily_outlook(
+        natal_data=natal_snap,
+        transit_data=delhi_snap,
+        dasha_tree=active_dasha_chain,
+        query_datetime=now_ist
+    )
+
     sookshma_summary = f"{active_dasha_4[0]} MD / {active_dasha_4[1]} AD / {active_dasha_4[2]} PD / {active_dasha_4[3]} SD"
 
     payload = {
@@ -869,13 +1437,14 @@ def generate_kundali(data: BirthInput):
             "name": data.name,
             "dob": data.dob,
             "tob": data.tob,
-            "place": location.address,
+            "place": resolved_address,
             "timezone": tz_name,
             "ascendant": f"{ZODIAC_SIGNS[d1_asc_sign - 1]} (Lord: {SIGN_LORDS[d1_asc_sign]})",
             "moon_sign": f"{ZODIAC_SIGNS[natal_moon_sign - 1]} (Lord: {SIGN_LORDS[natal_moon_sign]}) — {moon_nak_name} P{moon_pada}",
             "running_dasha": sookshma_summary,
             "current_dasha": sookshma_summary
         },
+        "daily_outlook": daily_outlook,
         "charts": all_vargas,
         "chart_insights": all_chart_insights,
         "house_insights": all_chart_insights.get("D1", {}),
@@ -908,6 +1477,7 @@ def generate_kundali(data: BirthInput):
     return payload
 
 @app.post("/api/dasha-sublevels")
+@app.post("/dasha-sublevels")
 def expand_dasha_level(req: DashaExpandRequest):
     if req.level < 1 or req.level >= 6:
         raise HTTPException(status_code=400, detail="Deha Dasha (Level 6) is the deepest level.")
@@ -927,68 +1497,78 @@ def expand_dasha_level(req: DashaExpandRequest):
     return {"level": next_level, "level_name": DASHA_LEVEL_NAMES[next_level - 1], "periods": children}
 
 @app.post("/api/transit")
-def get_custom_transit(req: TransitRequest):
-    session_key = req.session_id.lower()
-    if session_key not in CHART_STORE:
-        raise HTTPException(status_code=404, detail="Session not found. Please generate Kundali first.")
+@app.post("/transit")
+def calculate_custom_transit(req: TransitRequest):
+    meta = req.natal_meta
+    if not meta and req.session_id:
+        stored = CHART_STORE.get(req.session_id.lower(), {})
+        meta = stored.get("natal_meta")
 
-    stored = CHART_STORE[session_key]
-    natal_meta = stored.get("natal_meta", {})
-    d1_asc_sign = natal_meta.get("d1_asc_sign", 1)
-    natal_moon_sign = natal_meta.get("natal_moon_sign", 1)
-    d9_signs = natal_meta.get("d9_signs", {})
-    active_dasha_4 = natal_meta.get("active_dasha_4", ["Sun", "Moon", "Mars", "Rahu"])
+    if not meta:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing natal metadata. Please generate Kundali first."
+        )
 
     try:
-        transit_dt = datetime.strptime(f"{req.transit_date} {req.transit_time}", "%Y-%m-%d %H:%M")
+        naive_target = datetime.strptime(f"{req.transit_date} {req.transit_time}", "%Y-%m-%d %H:%M")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date or time format.")
+        raise HTTPException(status_code=400, detail="Invalid date or time format. Expected YYYY-MM-DD and HH:MM.")
 
     ist_tz = pytz.timezone("Asia/Kolkata")
-    local_transit_dt = ist_tz.localize(transit_dt)
-    utc_transit_dt = local_transit_dt.astimezone(pytz.utc)
+    ist_target = ist_tz.localize(naive_target)
+    utc_target = ist_target.astimezone(pytz.utc)
 
-    delhi_lat, delhi_lon = 28.6139, 77.2090
-    custom_snap = calculate_sidereal_snapshot(utc_transit_dt, delhi_lat, delhi_lon)
-    transit_signs = {p: int(info["abs_deg"] // 30.0) + 1 for p, info in custom_snap["raw_planets"].items()}
+    delhi_snap = calculate_sidereal_snapshot(utc_target, 28.6139, 77.2090)
+    transit_signs = {p: int(info["abs_deg"] // 30.0) + 1 for p, info in delhi_snap["raw_planets"].items()}
 
-    delhi_transit_chart, delhi_transit_table, delhi_transit_insights = build_varga_chart_and_insights(
-        custom_snap, 1, d9_signs, active_dasha_4, transit_signs
+    delhi_chart, delhi_table, delhi_insights = build_varga_chart_and_insights(
+        delhi_snap, 1, meta.get("d9_signs", {}), meta.get("active_dasha_4", ["Sun", "Moon", "Mars", "Jupiter"]), transit_signs
     )
-    asc_transit_chart, _, asc_transit_insights = build_varga_chart_and_insights(
-        custom_snap, 1, d9_signs, active_dasha_4, transit_signs, override_asc_sign=d1_asc_sign
+    asc_chart, _, asc_insights = build_varga_chart_and_insights(
+        delhi_snap, 1, meta.get("d9_signs", {}), meta.get("active_dasha_4", ["Sun", "Moon", "Mars", "Jupiter"]), transit_signs,
+        override_asc_sign=meta.get("d1_asc_sign", 1)
     )
-    moon_transit_chart, _, moon_transit_insights = build_varga_chart_and_insights(
-        custom_snap, 1, d9_signs, active_dasha_4, transit_signs, override_asc_sign=natal_moon_sign
+    moon_chart, _, moon_insights = build_varga_chart_and_insights(
+        delhi_snap, 1, meta.get("d9_signs", {}), meta.get("active_dasha_4", ["Sun", "Moon", "Mars", "Jupiter"]), transit_signs,
+        override_asc_sign=meta.get("natal_moon_sign", 1)
     )
 
-    result_transit = {
-        "timestamp": f"{req.transit_date} {req.transit_time} IST",
-        "delhi_asc": f"{ZODIAC_SIGNS[custom_snap['asc_sign'] - 1]} (New Delhi Lagna)",
-        "delhi_chart": delhi_transit_chart,
-        "chart": asc_transit_chart,
-        "asc_chart": asc_transit_chart,
-        "moon_chart": moon_transit_chart,
-        "moon_transit_chart": moon_transit_chart,
-        "table": delhi_transit_table
+    return {
+        "timestamp": ist_target.strftime("%Y-%m-%d %H:%M IST"),
+        "delhi_asc": f"{ZODIAC_SIGNS[delhi_snap['asc_sign'] - 1]} (New Delhi Lagna)",
+        "delhi_chart": delhi_chart,
+        "chart": asc_chart,
+        "asc_chart": asc_chart,
+        "moon_chart": moon_chart,
+        "moon_transit_chart": moon_chart,
+        "insights": {
+            "TRANSIT_DELHI": delhi_insights,
+            "TRANSIT_ASC": asc_insights,
+            "TRANSIT_MOON": moon_insights
+        },
+        "table": delhi_table
     }
-    return {"transit": result_transit}
 
 @app.post("/api/ask-astrologer")
+@app.post("/ask-astrologer")
 def ask_agentic_astrologer(req: AgentQuery):
-    session_key = req.session_id.lower()
-    if session_key not in CHART_STORE:
-        raise HTTPException(status_code=404, detail="Please generate the Kundali first.")
+    stored = req.context_data
+    if not stored and req.session_id:
+        stored = CHART_STORE.get(req.session_id.lower())
 
-    stored = CHART_STORE[session_key]
+    if not stored:
+        raise HTTPException(status_code=400, detail="Please generate the Kundali first.")
 
     def inspect_chart_house(chart_name: str, house_number: int) -> dict:
-        return sanitize_for_json(stored["chart_insights"].get(chart_name.upper(), {}).get(house_number, {}))
+        house_dict = stored.get("chart_insights", {}).get(chart_name.upper(), {})
+        data = house_dict.get(str(house_number)) or house_dict.get(int(house_number), {})
+        return sanitize_for_json(data)
 
     def get_planets_and_dasha() -> dict:
         return sanitize_for_json({
-            "profile": stored["profile"],
-            "classifications": stored["planet_classifications"]
+            "profile": stored.get("profile", {}),
+            "classifications": stored.get("planet_classifications", [])
         })
 
     client = ai_client
@@ -1004,6 +1584,8 @@ def ask_agentic_astrologer(req: AgentQuery):
     models_to_try = [
         os.environ.get("GEMINI_MODEL"),
         "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
         "gemini-3.5-flash",
         "gemini-3.8-flash"
     ]
@@ -1018,15 +1600,15 @@ def ask_agentic_astrologer(req: AgentQuery):
     last_error = None
     for model_name in candidate_models:
         try:
-            chat = client.chats.create(
+            response = client.models.generate_content(
                 model=model_name,
+                contents=req.question,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     tools=[inspect_chart_house, get_planets_and_dasha],
                     temperature=0.3,
                 ),
             )
-            response = chat.send_message(req.question)
             return {"analysis": response.text}
         except Exception as e:
             last_error = e

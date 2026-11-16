@@ -391,6 +391,117 @@
       line-height: 1.55;
     }
 
+    /* Daily Planetary Outlook Styles */
+    .daily-outlook-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      margin-bottom: 22px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+    }
+    .daily-outlook-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+    }
+    .daily-outlook-title {
+      margin: 0;
+      color: var(--primary);
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .daily-meta-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .meta-pill {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: #faf6f0;
+      border: 1px solid #e0d3c1;
+      color: var(--text);
+    }
+    .pill-sade-sati-active {
+      background: #fef2f2;
+      border-color: #fecaca;
+      color: #991b1b;
+    }
+    .pill-sade-sati-none {
+      background: #f0fdf4;
+      border-color: #bbf7d0;
+      color: #166534;
+    }
+    .outlook-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 14px;
+    }
+    .outlook-card {
+      background: #fffdfa;
+      border: 1px solid #eadbc8;
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 8px;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .outlook-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+    }
+    .outlook-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .outlook-item-title {
+      font-weight: 700;
+      font-size: 14.5px;
+      color: var(--text);
+      margin: 0;
+    }
+    .badge-favourable {
+      background: #dcfce7;
+      color: #15803d;
+      border: 1px solid #86efac;
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .badge-mindful {
+      background: #fef3c7;
+      color: #b45309;
+      border: 1px solid #fcd34d;
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .outlook-summary {
+      font-size: 13px;
+      line-height: 1.5;
+      color: #4b382a;
+      margin: 0;
+    }
+
     /* Responsive Media Queries for Mobile & Tablets */
     @media (max-width: 1024px) {
       .transit-charts-3 { grid-template-columns: 1fr; }
@@ -473,6 +584,7 @@
 
   <div id="workspace" style="display:none;">
     <div class="profile-grid" id="profileBanner"></div>
+    <div class="daily-outlook-wrap" id="dailyOutlookSection" style="display:none;"></div>
 
     <div class="nav-pages">
       <button class="page-btn active" onclick="switchPage('homePage', this)">1. Home (D1, D9 & Planets)</button>
@@ -739,25 +851,29 @@ function renderTransitSection(transit) {
 
 async function fetchCustomTransit() {
   if (!GLOBAL_KUNDALI_DATA) return alert("Please generate a Kundali first.");
-  const dateVal = document.getElementById("customTransitDate").value;
-  const timeVal = document.getElementById("customTransitTime").value;
-  if (!dateVal || !timeVal) return alert("Please select transit date and time.");
+  const tDate = document.getElementById("customTransitDate").value;
+  const tTime = document.getElementById("customTransitTime").value;
+  if (!tDate || !tTime) return alert("Please select transit date and time.");
 
   try {
-    const res = await fetch("http://localhost:8000/api/transit", {
+    const res = await fetch("/api/transit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        session_id: GLOBAL_KUNDALI_DATA.profile.name,
-        transit_date: dateVal,
-        transit_time: timeVal
+        natal_meta: GLOBAL_KUNDALI_DATA.natal_meta,
+        transit_date: tDate,
+        transit_time: tTime
       })
     });
-    const data = await res.json();
     if (res.ok) {
-      renderTransitSection(data.transit || data);
+      const transitData = await res.json();
+      if (transitData.insights && GLOBAL_KUNDALI_DATA.chart_insights) {
+        Object.assign(GLOBAL_KUNDALI_DATA.chart_insights, transitData.insights);
+      }
+      renderTransitSection(transitData);
     } else {
-      alert("Error: " + (data.detail || "Failed to calculate custom transit."));
+      const errData = await res.json().catch(() => ({}));
+      alert("Error: " + (errData.detail || "Failed to calculate custom transit."));
     }
   } catch (err) {
     alert("Network error: " + err.message);
@@ -1197,7 +1313,7 @@ function renderDashaColumn(level, title, periods, autoSelectActive = false) {
       if (level === 1 && p.antardashas) {
         renderDashaColumn(2, "2. Antardasha", p.antardashas, false);
       } else {
-        const res = await fetch("http://localhost:8000/api/dasha-sublevels", {
+        const res = await fetch("/api/dasha-sublevels", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1230,13 +1346,17 @@ document.getElementById("kundaliForm").addEventListener("submit", async (e) => {
     place: document.getElementById("place").value
   };
 
-  const res = await fetch("http://localhost:8000/api/kundali", {
+  const res = await fetch("/api/kundali", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
 
-  if (!res.ok) { alert("Error calculating Kundali. Please verify the city name."); return; }
+  if (!res.ok) {
+    const errText = await res.text();
+    alert(`Server Error (${res.status}): ${errText}`);
+    return;
+  }
   const data = await res.json();
   GLOBAL_KUNDALI_DATA = data;
 
@@ -1248,6 +1368,46 @@ document.getElementById("kundaliForm").addEventListener("submit", async (e) => {
     <div class="profile-item"><strong>Natal Moon Sign (Rashi)</strong>${data.profile.moon_sign}</div>
     <div class="profile-item"><strong>Running Dasha (MD–SD)</strong>${data.profile.running_dasha}</div>
   `;
+
+  // Render Daily Planetary Outlook
+  if (data.daily_outlook) {
+    const dOut = data.daily_outlook;
+    const ssActive = dOut.sade_sati && dOut.sade_sati.active;
+    const ssPhase = dOut.sade_sati ? dOut.sade_sati.phase : "None";
+    const ssPillClass = ssActive ? "pill-sade-sati-active" : "pill-sade-sati-none";
+    const ssText = ssActive ? `Sade Sati: ${ssPhase} Phase` : "Sade Sati: Inactive";
+
+    const itemsHtml = (dOut.items || []).map(item => {
+      const isFav = item.status === "favourable";
+      const badgeCls = isFav ? "badge-favourable" : "badge-mindful";
+      return `
+        <div class="outlook-card">
+          <div class="outlook-top">
+            <h4 class="outlook-item-title">${item.title}</h4>
+            <span class="${badgeCls}">${item.badge_label}</span>
+          </div>
+          <p class="outlook-summary">${item.summary}</p>
+        </div>
+      `;
+    }).join("");
+
+    document.getElementById("dailyOutlookSection").innerHTML = `
+      <div class="daily-outlook-header">
+        <h3 class="daily-outlook-title">
+          <span>Daily Planetary Outlook</span>
+          <span style="font-size: 12px; font-weight: normal; color: var(--text-muted);">(${dOut.generated_at})</span>
+        </h3>
+        <div class="daily-meta-pills">
+          <span class="meta-pill"><strong>Pratyantardasha:</strong> ${dOut.active_pratyantardasha}</span>
+          <span class="meta-pill ${ssPillClass}"><strong>${ssText}</strong></span>
+        </div>
+      </div>
+      <div class="outlook-grid">
+        ${itemsHtml}
+      </div>
+    `;
+    document.getElementById("dailyOutlookSection").style.display = "block";
+  }
 
   // Page 1: D1, D9 & Planet Table
   document.getElementById("chart-D1").innerHTML = renderNorthIndianSVG(data.charts.D1, "D1");
@@ -1320,18 +1480,30 @@ document.getElementById("kundaliForm").addEventListener("submit", async (e) => {
 });
 
 async function askAgent() {
-  const name = document.getElementById("name").value;
+  if (!GLOBAL_KUNDALI_DATA) return alert("Please generate a Kundali first.");
   const question = document.getElementById("aiQuestion").value;
+  if (!question) return alert("Please enter a question.");
   const box = document.getElementById("aiResponse");
   box.textContent = "AI Agent is analyzing Moon Sign, Sookshma Dasha, Yogakaraka, and D1/D9...";
 
-  const res = await fetch("http://localhost:8000/api/ask-astrologer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: name, question: question })
-  });
-  const data = await res.json();
-  box.textContent = res.ok ? data.analysis : "Error: " + data.detail;
+  try {
+    const res = await fetch("/api/ask-astrologer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: question,
+        context_data: {
+          profile: GLOBAL_KUNDALI_DATA.profile,
+          planet_classifications: GLOBAL_KUNDALI_DATA.planet_classifications,
+          chart_insights: GLOBAL_KUNDALI_DATA.chart_insights
+        }
+      })
+    });
+    const data = await res.json();
+    box.textContent = res.ok ? data.analysis : "Error: " + (data.detail || "Request failed.");
+  } catch (err) {
+    box.textContent = "Error: " + err.message;
+  }
 }
 </script>
 </body>
